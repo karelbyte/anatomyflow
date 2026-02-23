@@ -1,0 +1,2 @@
+driver: postgres
+connection_string: "postgres://user:pass@localhost:5432/mydb?sslmode=disable"

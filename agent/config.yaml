@@ -1,0 +1,4 @@
+driver: postgres
+connection_string: "postgres://postgres:7810071@localhost:5432/zermattcrmdb?sslmode=disable"
+backend_ws_url: "ws://localhost:8000/ws/agent"
+backend_api_key: "Z7KUfoxeCS_z2t4rQo2zcD3bgxOgcuPDJbM6UT5tEgQ"

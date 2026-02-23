@@ -1,0 +1,16 @@
+{
+  "nodes": [
+    { "id": "table:orders", "type": "default", "position": { "x": 0, "y": 0 }, "data": { "label": "orders", "kind": "table" } },
+    { "id": "model:Order", "type": "default", "position": { "x": 220, "y": 0 }, "data": { "label": "Order", "kind": "model" } },
+    { "id": "controller:OrderController", "type": "default", "position": { "x": 440, "y": 0 }, "data": { "label": "OrderController", "kind": "controller" } },
+    { "id": "route:POST /api/orders", "type": "default", "position": { "x": 660, "y": 0 }, "data": { "label": "POST /api/orders", "kind": "route" } },
+    { "id": "table:users", "type": "default", "position": { "x": 0, "y": 100 }, "data": { "label": "users", "kind": "table" } },
+    { "id": "model:User", "type": "default", "position": { "x": 220, "y": 100 }, "data": { "label": "User", "kind": "model" } }
+  ],
+  "edges": [
+    { "id": "e1", "source": "table:orders", "target": "model:Order" },
+    { "id": "e2", "source": "model:Order", "target": "controller:OrderController" },
+    { "id": "e3", "source": "controller:OrderController", "target": "route:POST /api/orders" },
+    { "id": "e4", "source": "table:users", "target": "model:User" }
+  ]
+}

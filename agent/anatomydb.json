@@ -1,0 +1,142 @@
+{
+  "database": "anatomydb",
+  "tables": [
+    {
+      "name": "analysis_jobs",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid"
+        },
+        {
+          "name": "project_id",
+          "type": "uuid"
+        },
+        {
+          "name": "status",
+          "type": "character varying"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone"
+        },
+        {
+          "name": "started_at",
+          "type": "timestamp with time zone"
+        },
+        {
+          "name": "finished_at",
+          "type": "timestamp with time zone"
+        },
+        {
+          "name": "error_message",
+          "type": "text"
+        },
+        {
+          "name": "log",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "name": "graphs",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer"
+        },
+        {
+          "name": "project_id",
+          "type": "uuid"
+        },
+        {
+          "name": "graph",
+          "type": "jsonb"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone"
+        }
+      ]
+    },
+    {
+      "name": "project_checkpoints",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer"
+        },
+        {
+          "name": "project_id",
+          "type": "uuid"
+        },
+        {
+          "name": "job_id",
+          "type": "uuid"
+        },
+        {
+          "name": "checkpoint",
+          "type": "jsonb"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone"
+        }
+      ]
+    },
+    {
+      "name": "project_schemas",
+      "columns": [
+        {
+          "name": "id",
+          "type": "integer"
+        },
+        {
+          "name": "project_id",
+          "type": "uuid"
+        },
+        {
+          "name": "schema",
+          "type": "jsonb"
+        },
+        {
+          "name": "received_at",
+          "type": "timestamp with time zone"
+        }
+      ]
+    },
+    {
+      "name": "projects",
+      "columns": [
+        {
+          "name": "id",
+          "type": "uuid"
+        },
+        {
+          "name": "name",
+          "type": "character varying"
+        },
+        {
+          "name": "codebase_path",
+          "type": "text"
+        },
+        {
+          "name": "agent_api_key",
+          "type": "character varying"
+        },
+        {
+          "name": "created_at",
+          "type": "timestamp with time zone"
+        },
+        {
+          "name": "updated_at",
+          "type": "timestamp with time zone"
+        },
+        {
+          "name": "excluded_paths",
+          "type": "jsonb"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+driver: postgres
+host: localhost
+port: 5432
+user: myuser
+password: mypass
+database: mydb
+sslmode: disable
