@@ -1,14 +1,30 @@
 import { useCallback, useEffect, useState } from 'react'
 import toast from 'react-hot-toast'
-import { FiEdit2, FiEye, FiPlus, FiPlay, FiTrash2, FiX } from 'react-icons/fi'
+import { FiEdit2, FiEye, FiInfo, FiPlus, FiPlay, FiTrash2, FiX } from 'react-icons/fi'
 import { Button, Text } from '../components/atoms'
 import { fetchProjects, deleteProject } from '../lib/api'
+
+const ONBOARDING_KEY = 'projectanatomy_onboarding_dismissed'
 
 export default function ProjectsList({ onNewProject, onOpenAnalysis, onViewGraph }) {
   const [projects, setProjects] = useState([])
   const [loading, setLoading] = useState(true)
   const [deleteTarget, setDeleteTarget] = useState(null)
   const [deleting, setDeleting] = useState(false)
+  const [onboardingDismissed, setOnboardingDismissed] = useState(() => {
+    try {
+      return localStorage.getItem(ONBOARDING_KEY) === '1'
+    } catch {
+      return false
+    }
+  })
+
+  const dismissOnboarding = useCallback(() => {
+    try {
+      localStorage.setItem(ONBOARDING_KEY, '1')
+    } catch (_) {}
+    setOnboardingDismissed(true)
+  }, [])
 
   const load = useCallback(() => {
     setLoading(true)
@@ -56,14 +72,28 @@ export default function ProjectsList({ onNewProject, onOpenAnalysis, onViewGraph
     <div className="max-w-2xl mx-auto p-6">
       <Text as="h1" variant="title">Anatomy Flow</Text>
       <Text variant="muted">Dissecting code, visualizing connections.</Text>
-      {projects.length !== 0 ? <div className="flex items-center justify-end mb-6">
+      {!onboardingDismissed && (
+        <div className="mt-4 rounded-lg border border-sky-600/50 bg-sky-900/20 p-4 flex items-start gap-3">
+          <FiInfo className="w-5 h-5 text-sky-400 flex-shrink-0 mt-0.5" />
+          <div className="flex-1 min-w-0">
+            <Text variant="strong" className="block mb-1">What does ProjectAnatomy do?</Text>
+            <Text variant="body" className="text-zinc-300 text-sm">
+              Connect a codebase (local or GitHub), optionally attach the schema via the agent, then run analysis to build a dependency graph: tables, models, controllers, views, routes (and for Next.js: pages, API routes, components). Click nodes to see code and highlight dependencies.
+            </Text>
+          </div>
+          <Button variant="ghost" onClick={dismissOnboarding} className="flex-shrink-0" aria-label="Dismiss">
+            <FiX className="w-4 h-4" />
+          </Button>
+        </div>
+      )}
+      {projects.length !== 0 ? <div className="flex items-center justify-end mb-6 mt-6">
         <Button variant="primary" onClick={onNewProject} className="inline-flex items-center gap-2">
           <FiPlus className="w-4 h-4" /> New project
         </Button>
       </div> : <div className='h-10'></div>}
       {projects.length === 0 ? (
         <div className="rounded-lg border border-zinc-600 bg-zinc-800/50 p-8 text-center">
-          <Text variant="muted" className="block mb-4">No projects yet. Create one to connect a codebase and the agent.</Text>
+          <Text variant="muted" className="block mb-4">No projects yet. Create one to connect a codebase and optionally the agent.</Text>
           <Button variant="primary" onClick={onNewProject} className="inline-flex items-center gap-2">
             <FiPlus className="w-4 h-4" /> Create project
           </Button>

@@ -74,7 +74,7 @@ Return a single JSON object with this exact structure (no markdown, no extra tex
     {{ "id": "unique_id", "label": "display name", "kind": "table" }},
     {{ "id": "unique_id", "label": "display name", "kind": "model" }},
     {{ "id": "unique_id", "label": "display name", "kind": "controller" }},
-    {{ "id": "unique_id", "label": "display name", "kind": "route" }},
+    {{ "id": "unique_id", "label": "display name", "kind": "route", "code": "optional: PHP method source" }},
     {{ "id": "view:dot.path", "label": "dot.path", "kind": "view" }}
   ],
   "edges": [
@@ -86,7 +86,8 @@ Rules:
 - kind must be one of: table, model, controller, route, view
 - For Laravel: link table -> model (maps_to), model -> controller (uses), controller -> route (calls). Use table names from the schema and infer model/controller/route names from the code.
 - If the controller returns a view (e.g. return view('users.index') or view('users.show', ...)), add a node with kind "view", id "view:users.index" (dot path), and an edge from controller to that view with relation "renders".
-- id must be unique (e.g. table:orders, model:Order, controller:OrderController, route:POST /api/orders, view:users.index).
+- id must be unique (e.g. table:orders, model:Order, controller:OrderController, route:cliente.index or route:GET /clients, view:users.index).
+- For each route node, include a "code" field with the exact PHP source of the controller method that handles that route (e.g. the full method: public function index(Request $request): Response {{ ... }} ). Copy the method body exactly as in the file so the user can see the implementation.
 - Only include nodes and edges you can infer from the schema and the controller code.
 """
 

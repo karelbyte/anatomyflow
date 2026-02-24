@@ -1,8 +1,8 @@
 export const KIND_CONFIG = {
   table: {
-    color: '#40c057',
+    color: 'yellow',
     bg: 'rgba(64, 192, 87, 0.12)',
-    border: '#40c057',
+    border: 'yellow',
     label: 'Table',
   },
   model: {
@@ -28,6 +28,51 @@ export const KIND_CONFIG = {
     bg: 'rgba(32, 201, 151, 0.12)',
     border: '#20c997',
     label: 'View',
+  },
+  // Next.js
+  page: {
+    color: '#e64980',
+    bg: 'rgba(230, 73, 128, 0.12)',
+    border: '#e64980',
+    label: 'Page',
+  },
+  api_route: {
+    color: '#15aabf',
+    bg: 'rgba(21, 170, 191, 0.12)',
+    border: '#15aabf',
+    label: 'API Route',
+  },
+  component: {
+    color: '#7950f2',
+    bg: 'rgba(121, 80, 242, 0.12)',
+    border: '#7950f2',
+    label: 'Component',
+  },
+  // Express
+  express_route: {
+    color: '#0ca678',
+    bg: 'rgba(12, 166, 120, 0.12)',
+    border: '#0ca678',
+    label: 'Express Route',
+  },
+  middleware: {
+    color: '#748ffc',
+    bg: 'rgba(116, 143, 252, 0.12)',
+    border: '#748ffc',
+    label: 'Middleware',
+  },
+  // NestJS
+  service: {
+    color: '#22b8cf',
+    bg: 'rgba(34, 184, 207, 0.12)',
+    border: '#22b8cf',
+    label: 'Service',
+  },
+  module: {
+    color: '#da77f2',
+    bg: 'rgba(218, 119, 242, 0.12)',
+    border: '#da77f2',
+    label: 'Module',
   },
 }
 

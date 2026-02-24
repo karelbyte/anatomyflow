@@ -25,8 +25,22 @@ from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+import time
 
 import db
+
+# API key opcional: si BACKEND_API_KEY está definido, todas las rutas /api/* (salvo health y auth/github) lo exigen
+_BACKEND_API_KEY = os.environ.get("BACKEND_API_KEY", "").strip() or None
+# CORS: si FRONTEND_URL está definido, solo ese origen (más localhost); si no, "*"
+_FRONTEND_URL = os.environ.get("FRONTEND_URL", "").strip() or None
+_RATE_LIMIT_PER_MIN = int(os.environ.get("RATE_LIMIT_PER_MIN", "100"))
+_RATE_LIMIT_ANALYZE_PER_MIN = int(os.environ.get("RATE_LIMIT_ANALYZE_PER_MIN", "5"))
+_rate_limit_store: dict[str, list[float]] = {}
+_rate_limit_lock = threading.Lock()
+_RATE_WINDOW = 60.0  # segundos
 
 # Colas SSE por proyecto: al recibir schema las notificamos para actualizar el front en vivo
 _sse_queues: dict[str, list[asyncio.Queue]] = {}
@@ -188,13 +202,78 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ProjectAnatomy API", lifespan=lifespan)
 
+
+class APIKeyMiddleware(BaseHTTPMiddleware):
+    """Si BACKEND_API_KEY está definido, exige X-API-Key en /api/* salvo health y auth/github."""
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        if path == "/api/health" or path.startswith("/api/auth/github"):
+            return await call_next(request)
+        if not _BACKEND_API_KEY:
+            return await call_next(request)
+        key = request.headers.get("X-API-Key", "").strip()
+        if key != _BACKEND_API_KEY:
+            return JSONResponse(status_code=401, content={"detail": "Invalid or missing X-API-Key"})
+        return await call_next(request)
+
+
+class RateLimitMiddleware(BaseHTTPMiddleware):
+    """Límite de peticiones por IP: general y más estricto para POST .../analyze."""
+
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        client = request.client.host if request.client else "unknown"
+        if request.headers.get("x-forwarded-for"):
+            client = request.headers["x-forwarded-for"].split(",")[0].strip()
+        now = time.time()
+        is_analyze = path.endswith("/analyze") or path.endswith("/analyze/resume")
+        limit = _RATE_LIMIT_ANALYZE_PER_MIN if (is_analyze and request.method == "POST") else _RATE_LIMIT_PER_MIN
+        key = f"{client}:analyze" if is_analyze else f"{client}:general"
+        with _rate_limit_lock:
+            if key not in _rate_limit_store:
+                _rate_limit_store[key] = []
+            times = _rate_limit_store[key]
+            times[:] = [t for t in times if now - t < _RATE_WINDOW]
+            if len(times) >= limit:
+                return JSONResponse(status_code=429, content={"detail": "Rate limit exceeded. Try again later."})
+            times.append(now)
+        return await call_next(request)
+
+
+_origins = ["*"]
+if _FRONTEND_URL:
+    _origins = [
+        o.strip() for o in _FRONTEND_URL.split(",") if o.strip()
+    ] or [_FRONTEND_URL]
+    if "http://localhost:5173" not in _origins and "http://127.0.0.1:5173" not in _origins:
+        _origins.extend(["http://localhost:5173", "http://127.0.0.1:5173"])
+
+app.add_middleware(APIKeyMiddleware)
+app.add_middleware(RateLimitMiddleware)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.exception_handler(HTTPException)
+def http_exception_handler(_request: Request, exc: HTTPException):
+    """Respuesta de error consistente: code + message (y detail para compatibilidad FastAPI)."""
+    detail = exc.detail
+    if isinstance(detail, list) and detail and isinstance(detail[0], dict):
+        message = detail[0].get("msg", str(detail[0]))
+    elif isinstance(detail, list) and detail:
+        message = str(detail[0])
+    else:
+        message = str(detail) if detail else "Error"
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": True, "code": exc.status_code, "message": message, "detail": detail},
+    )
 
 
 class GraphPayload(BaseModel):
@@ -351,6 +430,7 @@ def delete_project(project_id: str):
     if not proj:
         raise HTTPException(404, "Project not found")
     db.project_delete(project_id)
+    _delete_repo_folder(project_id)
     return {"ok": True}
 
 
@@ -438,6 +518,27 @@ def disconnect_github(project_id: str):
     return {"ok": True}
 
 
+@app.post("/api/projects/{project_id}/github/pull")
+def github_pull(project_id: str):
+    """
+    Actualiza el repositorio clonado desde GitHub (git fetch + checkout).
+    Si aún no está clonado, hace el clone. Útil para traer los últimos cambios del remoto.
+    """
+    proj = db.project_get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    repo_url = (proj.get("repo_url") or "").strip()
+    if not repo_url:
+        raise HTTPException(400, "This project has no GitHub repo. Set a repository in Step 1.")
+    try:
+        _resolve_codebase_path(proj, "")
+        return {"ok": True, "message": "Repository updated"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
 def _github_api_get(project_id: str, path: str) -> list | dict:
     """Llama a la API de GitHub con el token del proyecto. path sin barra inicial (ej. user/repos)."""
     token = db.project_get_github_token(project_id)
@@ -499,6 +600,26 @@ def _repos_dir() -> str:
     return d
 
 
+def _repo_clone_path(project_id: str) -> str:
+    """Ruta donde se clona el repo de un proyecto (para borrarla al eliminar el proyecto)."""
+    base = _repos_dir()
+    clone_name = re.sub(r"[^\w.-]", "_", project_id) or "repo"
+    return os.path.join(base, clone_name)
+
+
+def _delete_repo_folder(project_id: str) -> None:
+    """Elimina la carpeta del repo clonado si existe y está dentro de _repos_dir (seguridad)."""
+    base = os.path.abspath(_repos_dir())
+    clone_path = os.path.abspath(_repo_clone_path(project_id))
+    if not clone_path.startswith(base + os.sep) and clone_path != base:
+        return
+    if os.path.isdir(clone_path):
+        try:
+            shutil.rmtree(clone_path)
+        except OSError:
+            pass
+
+
 def _inject_github_token(url: str, token: str | None = None) -> str:
     """Inyecta el token en la URL HTTPS para clonar (token del proyecto OAuth o GITHUB_TOKEN env como fallback)."""
     t = (token or "").strip() or os.environ.get("GITHUB_TOKEN", "").strip()
@@ -530,9 +651,7 @@ def _clone_or_pull_repo(project_id: str, repo_url: str, branch: str, job_id: str
     project_token = db.project_get_github_token(project_id)
     url_with_auth = _inject_github_token(repo_url, project_token)
     base = _repos_dir()
-    # Usar un nombre de directorio seguro (project_id puede ser UUID)
-    clone_name = re.sub(r"[^\w.-]", "_", project_id) or "repo"
-    clone_path = os.path.join(base, clone_name)
+    clone_path = _repo_clone_path(project_id)
     if os.path.isdir(os.path.join(clone_path, ".git")):
         log(f"      Actualizando repo en {clone_path}…")
         try:
@@ -833,7 +952,7 @@ def _run_analyzer(
             return
         if proc.returncode != 0:
             db.job_append_log(job_id, f"ERROR: Analizador terminó con código {proc.returncode}")
-            db.job_set_failed(job_id, "Analyzer failed. Revisa el log.")
+            db.job_set_failed(job_id, "Analysis failed. Check the job log.")
             return
         db.job_append_log(job_id, "[4/4] Guardando grafo…")
         with open(out_path, "r", encoding="utf-8") as g:
@@ -843,11 +962,11 @@ def _run_analyzer(
         db.job_append_log(job_id, "Listo. Grafo guardado.")
         db.job_set_completed(job_id)
     except subprocess.TimeoutExpired:
-        db.job_append_log(job_id, "ERROR: Timeout del analizador.")
-        db.job_set_failed(job_id, "Analysis timeout")
+            db.job_append_log(job_id, "ERROR: Timeout del analizador.")
+            db.job_set_failed(job_id, "Timeout: el analizador tardó demasiado. Prueba con menos archivos o reanuda más tarde.")
     except Exception as e:
-        db.job_append_log(job_id, f"ERROR: {e}")
-        db.job_set_failed(job_id, str(e))
+            db.job_append_log(job_id, f"ERROR: {e}")
+            db.job_set_failed(job_id, f"Error: {e}. Check the log for details.")
     finally:
         with _analyzer_procs_lock:
             _job_checkpoint_dirs.pop(job_id, None)
@@ -875,7 +994,7 @@ def start_analyze(project_id: str):
         raise HTTPException(404, "Project not found")
     schema = db.schema_get_latest(project_id)
     if not schema:
-        raise HTTPException(400, "No schema received yet. Connect the agent and send the schema via WSS.")
+        schema = {}  # Opcional: analizar solo código sin agente/schema
     excluded_paths = proj.get("excluded_paths") or []
     db.graph_delete_all(project_id)
     db.checkpoint_clear(project_id)
@@ -909,7 +1028,7 @@ def resume_analyze(project_id: str):
         raise HTTPException(400, "No checkpoint to resume. Run an analysis and stop it first.")
     schema = db.schema_get_latest(project_id)
     if not schema:
-        raise HTTPException(400, "No schema. Connect the agent and send the schema via WSS.")
+        schema = {}  # Opcional: reanudar sin schema (solo código)
     excluded_paths = proj.get("excluded_paths") or []
     job_id = db.job_create(project_id)
     try:
@@ -975,6 +1094,169 @@ def cancel_job(job_id: str):
     return {"ok": True, "status": "cancelled"}
 
 
+def _resolve_node_to_file_path(node_id: str, path_prefix: str) -> tuple[str | None, str | None]:
+    """
+    Resuelve cualquier node_id del grafo a ruta de archivo (Laravel). Genérico para todos los recursos.
+    - model:Nombre -> app/Models/Nombre.php
+    - controller:NombreController -> app/Http/Controllers/NombreController.php
+    - view:carpeta.vista -> resources/views/carpeta/vista.blade.php
+    - route:recurso.accion -> app/Http/Controllers/RecursoController.php + método 'accion'
+    Retorna (relative_path, method_name); method_name solo para route (para extraer el método).
+    """
+    if not node_id or ":" not in node_id:
+        return None, None
+    kind, rest = node_id.split(":", 1)
+    rest = (rest or "").strip()
+    if not rest:
+        return None, None
+    kind = kind.lower()
+    if kind == "table":
+        return None, None  # DDL from schema, not file
+    if kind == "model":
+        return f"app/Models/{rest}.php", None
+    if kind == "controller":
+        return f"app/Http/Controllers/{rest}.php", None
+    if kind == "view":
+        # view:users.index -> resources/views/users/index.blade.php
+        view_path = rest.replace(".", "/") + ".blade.php"
+        return f"resources/views/{view_path}", None
+    if kind == "route":
+        # route:recurso.accion (ej. clients.index, orders.show) -> RecursoController + método
+        if "." in rest:
+            controller_part, method_name = rest.split(".", 1)
+            controller_part = (controller_part or "").strip()
+            method_name = (method_name or "").strip()
+            if controller_part and method_name:
+                # PascalCase + Controller (cualquier recurso: clients, orders, products, ...)
+                name = controller_part[0].upper() + controller_part[1:] if controller_part else ""
+                if not name.endswith("Controller"):
+                    name += "Controller"
+                return f"app/Http/Controllers/{name}.php", method_name
+        return None, None
+    return None, None
+
+
+def _route_controller_candidates(rel_path: str) -> list[str]:
+    """
+    Para cualquier controlador: devuelve [path_original, path_alternativo] para probar
+    singular/plural (OrdersController vs OrderController, ProductsController vs ProductController, etc.).
+    """
+    if "Controller.php" not in rel_path or "Controllers/" not in rel_path:
+        return [rel_path]
+    base = "app/Http/Controllers/"
+    name = rel_path[len(base):-len(".php")]  # ej. OrdersController, ProductController
+    if not name.endswith("Controller"):
+        return [rel_path]
+    stem = name[:-len("Controller")]  # Orders, Product, ...
+    candidates = [rel_path]
+    if stem.endswith("s") and len(stem) > 1:
+        alt_stem = stem[:-1]  # Orders -> Order, Products -> Product
+        candidates.append(f"{base}{alt_stem}Controller.php")
+    else:
+        candidates.append(f"{base}{stem}sController.php")  # Order -> Orders, Product -> Products
+    return candidates
+
+
+def _extract_php_method(content: str, method_name: str) -> str | None:
+    """Extrae el cuerpo de un método PHP por nombre (public function methodName...)."""
+    import re
+    # Buscar public/protected/private function methodName(...) { ... } (con llaves balanceadas)
+    pattern = rf"(?:(?:public|protected|private)\s+)?function\s+{re.escape(method_name)}\s*\([^)]*\)\s*(?::\s*[\w\|\\\\]+)?\s*\{{"
+    match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    start = match.start()
+    brace_start = content.index("{", start)
+    depth = 1
+    i = brace_start + 1
+    while i < len(content) and depth > 0:
+        if content[i] == "{":
+            depth += 1
+        elif content[i] == "}":
+            depth -= 1
+        i += 1
+    return content[start:i].strip() if depth == 0 else None
+
+
+def _get_node_path_from_graph(graph: dict | None, node_id: str) -> tuple[str | None, str | None]:
+    """
+    Si el grafo tiene el nodo con file_path o (para route) controller_path + method_name,
+    devuelve (relative_path, method_name). Si no, (None, None).
+    """
+    if not graph or not node_id:
+        return None, None
+    for n in graph.get("nodes", []):
+        if n.get("id") != node_id:
+            continue
+        data = n.get("data") or {}
+        if data.get("file_path"):
+            method = (data.get("method_name") or "").strip() or None
+            return data["file_path"], method
+        if data.get("controller_path"):
+            method = (data.get("method_name") or "").strip()
+            if not method and ":" in node_id:
+                rest = node_id.split(":", 1)[-1]
+                method = (rest.split(".", 1)[-1] if "." in rest else "").strip() or None
+            return data["controller_path"], method
+        break
+    return None, None
+
+
+@app.get("/api/projects/{project_id}/node-code")
+def get_node_code(project_id: str, node_id: str):
+    """
+    Devuelve el código asociado a cualquier nodo del grafo leyendo del codebase.
+    Usa file_path/controller_path guardados en el grafo (del análisis) si existen; si no, infiere por convención.
+    """
+    proj = db.project_get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    try:
+        codebase_path = _resolve_codebase_path(proj, "")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(400, str(e))
+    if not os.path.isdir(codebase_path):
+        raise HTTPException(400, "Codebase path is not a directory")
+    graph = db.graph_get_latest(project_id)
+    rel_path, method_name = _get_node_path_from_graph(graph, node_id)
+    if not rel_path:
+        rel_path, method_name = _resolve_node_to_file_path(node_id, codebase_path)
+    if not rel_path:
+        raise HTTPException(404, f"Cannot resolve node to file: {node_id}")
+    codebase_abs = os.path.abspath(os.path.normpath(codebase_path))
+    candidates = _route_controller_candidates(rel_path) if method_name else [rel_path]
+    full_path = None
+    for candidate in candidates:
+        fp = os.path.abspath(os.path.normpath(os.path.join(codebase_path, candidate)))
+        if not fp.startswith(codebase_abs + os.sep) and fp != codebase_abs:
+            continue
+        if os.path.isfile(fp):
+            full_path = fp
+            rel_path = candidate
+            break
+    if not full_path:
+        raise HTTPException(404, f"File not found: {rel_path}")
+    try:
+        with open(full_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError as e:
+        raise HTTPException(500, str(e))
+    label = (node_id.split(":", 1)[-1] if ":" in node_id else node_id).strip()
+    if method_name:
+        code = _extract_php_method(content, method_name)
+        if not code:
+            code = content
+        language = "php"
+    else:
+        code = content
+        language = "sql" if node_id.lower().startswith("table:") else "php"
+    if rel_path.endswith(".blade.php"):
+        language = "blade"
+    return {"code": code, "language": language, "label": label, "file_path": rel_path}
+
+
 @app.get("/api/projects/{project_id}/graph")
 def get_project_graph(project_id: str):
     proj = db.project_get(project_id)
@@ -986,6 +1268,24 @@ def get_project_graph(project_id: str):
     return graph
 
 
+class ProjectGraphPayload(BaseModel):
+    nodes: list = Field(default_factory=list)
+    edges: list = Field(default_factory=list)
+
+
+@app.put("/api/projects/{project_id}/graph")
+def put_project_graph(project_id: str, payload: ProjectGraphPayload):
+    """Importar grafo: reemplaza el grafo del proyecto con nodes/edges enviados (export/import)."""
+    proj = db.project_get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    if not payload.nodes and not payload.edges:
+        raise HTTPException(400, "Graph must have at least nodes or edges.")
+    graph = {"nodes": payload.nodes, "edges": payload.edges}
+    db.graph_save(project_id, graph)
+    return {"ok": True, "message": "Graph imported."}
+
+
 @app.delete("/api/projects/{project_id}/graph")
 def delete_project_graph(project_id: str):
     """Elimina todo el grafo y los checkpoints del proyecto. Para iniciar un análisis de cero."""
@@ -995,6 +1295,110 @@ def delete_project_graph(project_id: str):
     db.graph_delete_all(project_id)
     db.checkpoint_clear(project_id)
     return {"ok": True}
+
+
+@app.get("/api/projects/{project_id}/node-notes")
+def get_project_node_notes(project_id: str):
+    """Devuelve { node_id: [note1, note2, ...], ... }."""
+    proj = db.project_get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    return {"notes": db.node_notes_get(project_id)}
+
+
+class NodeNotesPayload(BaseModel):
+    node_id: str
+    notes: list[str] = Field(default_factory=list)
+
+
+@app.patch("/api/projects/{project_id}/node-notes")
+def patch_project_node_notes(project_id: str, payload: NodeNotesPayload):
+    """Actualiza las notas de un nodo. Reemplaza la lista de notas de ese nodo."""
+    proj = db.project_get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    all_notes = db.node_notes_get(project_id)
+    if payload.notes:
+        all_notes[payload.node_id] = payload.notes
+    else:
+        all_notes.pop(payload.node_id, None)
+    db.node_notes_set(project_id, all_notes)
+    return {"ok": True, "notes": payload.notes}
+
+
+def _graph_impact_from_json(graph: dict, node_id: str) -> tuple[list[str], list[str]]:
+    """Calcula upstream y downstream desde el grafo JSON (nodes + edges). No usa Neo4j."""
+    edges = graph.get("edges") or []
+    incoming: dict[str, list[str]] = {}
+    outgoing: dict[str, list[str]] = {}
+    for e in edges:
+        src, tgt = e.get("source"), e.get("target")
+        if not src or not tgt:
+            continue
+        if tgt not in incoming:
+            incoming[tgt] = []
+        incoming[tgt].append(src)
+        if src not in outgoing:
+            outgoing[src] = []
+        outgoing[src].append(tgt)
+    upstream: list[str] = []
+    queue = [node_id]
+    seen = {node_id}
+    while queue:
+        cur = queue.pop()
+        for prev in incoming.get(cur, []):
+            if prev not in seen:
+                seen.add(prev)
+                upstream.append(prev)
+                queue.append(prev)
+    downstream: list[str] = []
+    queue = [node_id]
+    seen = {node_id}
+    while queue:
+        cur = queue.pop()
+        for nxt in outgoing.get(cur, []):
+            if nxt not in seen:
+                seen.add(nxt)
+                downstream.append(nxt)
+                queue.append(nxt)
+    return upstream, downstream
+
+
+def _graph_orphans_from_json(graph: dict) -> list[str]:
+    """Nodos sin ninguna arista (ni entrante ni saliente). Excluye clusterBg."""
+    node_ids = {n["id"] for n in (graph.get("nodes") or []) if not (n.get("id") or "").startswith("cluster-bg-")}
+    edges = graph.get("edges") or []
+    connected = set()
+    for e in edges:
+        if e.get("source"):
+            connected.add(e["source"])
+        if e.get("target"):
+            connected.add(e["target"])
+    return [nid for nid in node_ids if nid not in connected]
+
+
+@app.get("/api/projects/{project_id}/impact")
+def get_project_impact(project_id: str, node_id: str):
+    """Impacto de un nodo: upstream (de los que depende) y downstream (los que lo usan). Usa el grafo guardado en BD, no Neo4j."""
+    if db.project_get(project_id) is None:
+        raise HTTPException(404, "Project not found")
+    graph = db.graph_get_latest(project_id)
+    if not graph:
+        raise HTTPException(404, "No graph yet. Run analysis first.")
+    upstream, downstream = _graph_impact_from_json(graph, node_id)
+    return {"node_id": node_id, "upstream": upstream, "downstream": downstream}
+
+
+@app.get("/api/projects/{project_id}/orphans")
+def get_project_orphans(project_id: str):
+    """Nodos huérfanos (sin conexiones) del grafo del proyecto. Usa el grafo en BD, no Neo4j."""
+    if db.project_get(project_id) is None:
+        raise HTTPException(404, "Project not found")
+    graph = db.graph_get_latest(project_id)
+    if not graph:
+        raise HTTPException(404, "No graph yet. Run analysis first.")
+    orphan_ids = _graph_orphans_from_json(graph)
+    return {"orphan_ids": orphan_ids}
 
 
 @app.get("/api/graph/impact")

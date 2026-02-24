@@ -83,7 +83,7 @@ export default function NewProjectForm({ onCreated, onCancel }) {
             value={name}
             onChange={(e) => setName(e.target.value)}
             className="w-full px-3 py-2 rounded bg-zinc-900 border border-zinc-600 text-zinc-100 placeholder-zinc-500"
-            placeholder="My Laravel project"
+            placeholder="My awesome project"
             required
           />
         </div>

@@ -53,6 +53,21 @@ def filter_files_by_excluded_paths(files: list[str], base_path: str, excluded_pa
     return out
 
 
+def _has_node_like_files(path: str, exclude_dirs: tuple[str, ...], max_entries: int = 200) -> bool:
+    """True si hay archivos .js o .ts bajo path (para fallback cuando no hay package.json)."""
+    skip = set(exclude_dirs) | {"node_modules", "vendor", ".git"}
+    n = 0
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if d not in skip]
+        for name in files:
+            if name.lower().endswith((".js", ".ts")):
+                return True
+            n += 1
+            if n >= max_entries:
+                return False
+    return False
+
+
 def collect_files(
     path: str,
     extensions: tuple = (".php",),
@@ -241,6 +256,16 @@ def _schema_table_names(schema: dict) -> set:
     return names
 
 
+def _schema_has_tables(schema: dict) -> bool:
+    """True si el schema tiene al menos una tabla (análisis con BD). Si no, solo estructura de código."""
+    return bool(schema.get("tables"))
+
+
+NO_SCHEMA_PROMPT_SUFFIX = """
+
+Important: No database schema was provided. Extract only code structure (controllers, routes, pages, components, services, etc.). Do NOT include any nodes with kind "table". Return a single valid JSON object with "nodes" and "edges" arrays only. No markdown, no extra text."""
+
+
 def _filter_tables_to_schema_only(graph: dict, schema: dict) -> None:
     """Elimina nodos tipo 'table' que no existan en el esquema (DB real). También elimina aristas que los referencian."""
     valid = _schema_table_names(schema)
@@ -275,6 +300,26 @@ def _mark_orphans(graph: dict) -> None:
         n["orphan"] = n["id"] in orphan_ids
 
 
+def _attach_route_controller_paths(graph: dict) -> None:
+    """Para cada nodo route, si hay un controller que apunta a él, guarda controller_path y method_name."""
+    nodes_by_id = {n["id"]: n for n in graph.get("nodes", [])}
+    for e in graph.get("edges", []):
+        cid, rid = e.get("from"), e.get("to")
+        if not cid or not rid:
+            continue
+        controller = nodes_by_id.get(cid)
+        route = nodes_by_id.get(rid)
+        if not controller or not route or (route.get("kind") or "").lower() != "route":
+            continue
+        if not controller.get("file_path"):
+            continue
+        route["controller_path"] = controller["file_path"]
+        if "." in (route.get("id") or ""):
+            route["method_name"] = (route["id"].split(".", 1)[-1] or "").strip()
+        else:
+            route["method_name"] = ""
+
+
 def merge_graphs(graphs: list[dict]) -> dict:
     nodes_by_id = {}
     edges_set = set()
@@ -287,6 +332,8 @@ def merge_graphs(graphs: list[dict]) -> dict:
                 nodes_by_id[nid] = {"id": nid, "label": n.get("label", nid), "kind": n.get("kind", "default")}
             if n.get("code") and not nodes_by_id[nid].get("code"):
                 nodes_by_id[nid]["code"] = n["code"]
+            if n.get("file_path") and not nodes_by_id[nid].get("file_path"):
+                nodes_by_id[nid]["file_path"] = n["file_path"]
         for e in g.get("edges", []):
             fid, tid = e.get("from"), e.get("to")
             if fid and tid:
@@ -329,10 +376,14 @@ def _layout_by_clusters(graph: dict) -> list[dict]:
     nodes_by_id = {n["id"]: n for n in graph.get("nodes", [])}
     edges = graph.get("edges", [])
     incoming, outgoing = _build_adjacency(edges)
+    # Semilla de clusters: controller (Laravel/Nest), page (Next.js), express_route (Express)
     controller_ids = [nid for nid, n in nodes_by_id.items() if n.get("kind") == "controller"]
+    page_ids = [nid for nid, n in nodes_by_id.items() if n.get("kind") == "page"]
+    express_route_ids = [nid for nid, n in nodes_by_id.items() if n.get("kind") == "express_route"]
+    seed_ids = controller_ids or page_ids or express_route_ids
     assigned = set()
     clusters = []
-    for cid in controller_ids:
+    for cid in seed_ids:
         cluster_ids = _cluster_around_controller(cid, incoming, outgoing)
         cluster_ids = [nid for nid in cluster_ids if nid in nodes_by_id and nid not in assigned]
         if not cluster_ids:
@@ -344,8 +395,8 @@ def _layout_by_clusters(graph: dict) -> list[dict]:
     if orphan:
         clusters.append(orphan)
 
-    kind_order = {"table": 0, "model": 1, "controller": 2, "route": 3, "view": 4}
-    kinds_layout = ["table", "model", "controller", "route", "view"]
+    kind_order = {"table": 0, "model": 1, "controller": 2, "route": 3, "view": 4, "page": 2, "api_route": 3, "component": 4, "express_route": 2, "middleware": 3, "service": 1, "module": 0}
+    kinds_layout = ["table", "model", "controller", "route", "view", "page", "api_route", "component", "express_route", "middleware", "service", "module"]
     col_width = 240
     row_height = 90
     cluster_gap = 80
@@ -407,6 +458,12 @@ def _layout_by_clusters(graph: dict) -> list[dict]:
         data = {"label": n.get("label", nid), "kind": n.get("kind", "default"), "orphan": n.get("orphan", False)}
         if n.get("code"):
             data["code"] = n["code"]
+        if n.get("file_path"):
+            data["file_path"] = n["file_path"]
+        if n.get("controller_path"):
+            data["controller_path"] = n["controller_path"]
+        if n.get("method_name") is not None:
+            data["method_name"] = n["method_name"]
         result.append({
             "id": nid,
             "type": "default",
@@ -508,16 +565,44 @@ def main():
         except (AttributeError, ValueError):
             pass
 
-    base = target_path if os.path.isdir(target_path) else os.path.dirname(target_path)
+    base = os.path.normpath(os.path.abspath(
+        target_path if os.path.isdir(target_path) else os.path.dirname(target_path)
+    ))
+    target_path = base
     project_type = None
     for pt in get_project_types():
         if pt["detect"](base):
             project_type = pt
             break
 
-    extensions = project_type["extensions"] if project_type else (".php",)
     # Siempre excluir vendor/node_modules/coverage; el tipo de proyecto puede añadir más
     default_exclude = ("vendor", "node_modules", "coverage")
+
+    # Fallback 1: si hay package.json pero ningún tipo lo detectó (path/encoding en detect), elegir por dependencias
+    if project_type is None and os.path.isfile(os.path.join(base, "package.json")):
+        try:
+            with open(os.path.join(base, "package.json"), "r", encoding="utf-8") as f:
+                pkg = json.load(f)
+            deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
+            types_by_name = {pt["name"]: pt for pt in get_project_types()}
+            if "next" in deps:
+                project_type = types_by_name.get("nextjs")
+            elif "@nestjs/core" in deps:
+                project_type = types_by_name.get("nestjs")
+            elif "express" in deps:
+                project_type = types_by_name.get("express")
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Fallback 2: si sigue sin tipo pero hay archivos .js/.ts, usar Express (evita "no .php files" en repos Node)
+    if project_type is None and _has_node_like_files(base, default_exclude):
+        types_by_name = {pt["name"]: pt for pt in get_project_types()}
+        project_type = types_by_name.get("express")
+
+    if project_type:
+        print(f"Using project type: {project_type['name']!r}", file=sys.stderr)
+
+    extensions = project_type["extensions"] if project_type else (".php",)
     exclude_dirs = tuple(project_type.get("exclude_dirs") or ()) if project_type else ()
     exclude_dirs = tuple(set(default_exclude) | set(exclude_dirs))
     try:
@@ -535,6 +620,8 @@ def main():
     print(f"Found {len(files)} file(s) to analyze", file=sys.stderr)
 
     schema = load_schema(schema_path)
+    if not _schema_has_tables(schema):
+        print("No database schema (empty or no tables). Extracting code structure only.", file=sys.stderr)
 
     provider = None
     flag_provider = None
@@ -590,6 +677,8 @@ def main():
                 try:
                     code = load_file(filepath)
                     prompt = build_prompt_fn(schema, code)
+                    if not _schema_has_tables(schema):
+                        prompt += NO_SCHEMA_PROMPT_SUFFIX
                     raw = provider(prompt)
                     graph = parse_llm_json(raw)
                     if code_kind:
@@ -597,11 +686,15 @@ def main():
                         for n in graph.get("nodes", []):
                             if (n.get("kind") or "").lower() == kind_lower:
                                 n["code"] = code
+                                n["file_path"] = rel
                     graphs.append(graph)
                     processed_set.add(rel)
                     save_checkpoint_if_needed()
-                except (json.JSONDecodeError, ValueError, Exception) as e:
-                    print(f"    Skip (se reintentará al final): {e}", file=sys.stderr)
+                except json.JSONDecodeError as e:
+                    print(f"    LLM_INVALID_JSON: {e}", file=sys.stderr)
+                    to_retry.append((filepath, rel, build_prompt_fn, code_kind))
+                except (ValueError, Exception) as e:
+                    print(f"    LLM_ERROR: {e}", file=sys.stderr)
                     to_retry.append((filepath, rel, build_prompt_fn, code_kind))
     else:
         fallback_prompt = LARAVEL["variants"]["controllers"]["build_prompt"]
@@ -618,16 +711,22 @@ def main():
             try:
                 code = load_file(filepath)
                 prompt = fallback_prompt(schema, code)
+                if not _schema_has_tables(schema):
+                    prompt += NO_SCHEMA_PROMPT_SUFFIX
                 raw = provider(prompt)
                 graph = parse_llm_json(raw)
                 for n in graph.get("nodes", []):
                     if (n.get("kind") or "").lower() == "controller":
                         n["code"] = code
+                        n["file_path"] = rel
                 graphs.append(graph)
                 processed_set.add(rel)
                 save_checkpoint_if_needed()
-            except (json.JSONDecodeError, ValueError, Exception) as e:
-                print(f"    Skip (se reintentará al final): {e}", file=sys.stderr)
+            except json.JSONDecodeError as e:
+                print(f"    LLM_INVALID_JSON: {e}", file=sys.stderr)
+                to_retry.append((filepath, rel, fallback_prompt, "controller"))
+            except (ValueError, Exception) as e:
+                print(f"    LLM_ERROR: {e}", file=sys.stderr)
                 to_retry.append((filepath, rel, fallback_prompt, "controller"))
 
     # Reintentos: los que fallaron se procesan de nuevo al final (hasta MAX_RETRIES veces), con el mismo proveedor/modelo.
@@ -640,6 +739,8 @@ def main():
             try:
                 code = load_file(filepath)
                 prompt = build_prompt_fn(schema, code)
+                if not _schema_has_tables(schema):
+                    prompt += NO_SCHEMA_PROMPT_SUFFIX
                 raw = provider(prompt)
                 graph = parse_llm_json(raw)
                 if code_kind:
@@ -647,17 +748,22 @@ def main():
                     for n in graph.get("nodes", []):
                         if (n.get("kind") or "").lower() == kind_lower:
                             n["code"] = code
+                            n["file_path"] = rel
                 graphs.append(graph)
                 processed_set.add(rel)
                 save_checkpoint_if_needed()
                 print(f"    OK: {rel}", file=sys.stderr)
-            except (json.JSONDecodeError, ValueError, Exception) as e:
-                print(f"    Skip de nuevo: {rel} — {e}", file=sys.stderr)
+            except json.JSONDecodeError as e:
+                print(f"    LLM_INVALID_JSON: {rel} — {e}", file=sys.stderr)
+                next_retry.append((filepath, rel, build_prompt_fn, code_kind))
+            except (ValueError, Exception) as e:
+                print(f"    LLM_ERROR: {rel} — {e}", file=sys.stderr)
                 next_retry.append((filepath, rel, build_prompt_fn, code_kind))
         to_retry = next_retry
     if to_retry:
+        print(f"  ERROR: {len(to_retry)} archivo(s) fallaron tras {MAX_RETRIES} reintentos (revisa mensajes LLM_INVALID_JSON/LLM_ERROR arriba).", file=sys.stderr)
         for _fp, rel, _fn, _k in to_retry:
-            print(f"  Descartado tras {MAX_RETRIES} reintentos: {rel}", file=sys.stderr)
+            print(f"  Descartado: {rel}", file=sys.stderr)
 
     if not graphs:
         print("No graphs extracted. Check errors above.", file=sys.stderr)
@@ -666,6 +772,7 @@ def main():
     merged = merge_graphs(graphs)
     _filter_tables_to_schema_only(merged, schema)
     _mark_orphans(merged)
+    _attach_route_controller_paths(merged)
     for n in merged.get("nodes", []):
         if (n.get("kind") or "").lower() == "table":
             raw_id = n.get("id") or ""

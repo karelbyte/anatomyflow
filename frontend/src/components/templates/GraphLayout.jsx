@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef, useState } from 'react'
 import ReactFlow, {
   Background,
   Controls,
@@ -7,14 +7,15 @@ import ReactFlow, {
 import 'reactflow/dist/style.css'
 import { AppHeader, CodePanel, AnatomyNode, ClusterBg } from '../organisms'
 import { KIND_CONFIG } from '../../constants'
-
-const nodeTypes = { anatomy: AnatomyNode, clusterBg: ClusterBg }
+import { fetchNodeCode, fetchNodeNotes, updateNodeNotes } from '../../lib/api'
 
 const CODE_PANEL_MIN = 280
 const CODE_PANEL_MAX_PERCENT = 0.7
 const CODE_PANEL_DEFAULT = 420
 
-export default function GraphLayout({
+const CODE_KINDS_FETCH = ['model', 'view', 'controller', 'route', 'page', 'api_route', 'component', 'express_route', 'middleware', 'service', 'module']
+
+const GraphLayout = forwardRef(function GraphLayout({
   nodes,
   edges,
   nodesWithHighlight,
@@ -25,15 +26,52 @@ export default function GraphLayout({
   onPaneClick,
   onEdgeClick,
   onFileSelect,
+  onExport,
   selectedNodeId,
   onClearPath,
   error,
   selectedNode,
+  projectId,
   onBack,
-}) {
+  visibleKinds,
+  setVisibleKinds,
+  searchQuery,
+  setSearchQuery,
+  searchMatches,
+  onSearchSelect,
+}, ref) {
   const [codePanelWidth, setCodePanelWidth] = useState(CODE_PANEL_DEFAULT)
   const containerRef = useRef(null)
+  const reactFlowRef = useRef(null)
+  const reactFlowInstanceRef = useRef(null)
   const isDragging = useRef(false)
+  const [liveCode, setLiveCode] = useState(null)
+  const [liveCodeLoading, setLiveCodeLoading] = useState(false)
+  const [liveCodeError, setLiveCodeError] = useState(null)
+  const [nodeNotes, setNodeNotes] = useState({})
+
+  const nodeTypes = useMemo(() => ({
+    anatomy: (props) => <AnatomyNode {...props} nodeNotes={nodeNotes} />,
+    clusterBg: ClusterBg,
+  }), [nodeNotes])
+
+  useEffect(() => {
+    if (!projectId) return
+    fetchNodeNotes(projectId)
+      .then((data) => setNodeNotes(data.notes || {}))
+      .catch(() => setNodeNotes({}))
+  }, [projectId])
+
+  const onReactFlowInit = useCallback((instance) => {
+    reactFlowInstanceRef.current = instance
+  }, [])
+
+  useImperativeHandle(ref, () => ({
+    fitView: (opts) => {
+      const instance = reactFlowInstanceRef.current || reactFlowRef.current
+      instance?.fitView?.(opts)
+    },
+  }), [])
 
   const onResizeStart = useCallback((e) => {
     e.preventDefault()
@@ -66,22 +104,54 @@ export default function GraphLayout({
     }
   }, [])
 
-  const selectedCode = selectedNode?.data?.code ?? null
-  const selectedLabel = selectedNodeId ? selectedNode?.data?.label ?? selectedNodeId : null
-  const selectedCodeLanguage = selectedNode?.data?.kind === 'table' ? 'sql' : 'php'
+  const kind = (selectedNode?.data?.kind || '').toLowerCase()
+  const shouldFetchLive = projectId && selectedNodeId && CODE_KINDS_FETCH.includes(kind)
+
+  useEffect(() => {
+    if (!shouldFetchLive) {
+      setLiveCode(null)
+      setLiveCodeError(null)
+      return
+    }
+    setLiveCodeLoading(true)
+    setLiveCodeError(null)
+    fetchNodeCode(projectId, selectedNodeId)
+      .then(({ code, language, label, file_path }) => {
+        setLiveCode({ code, language, label, file_path })
+      })
+      .catch((e) => {
+        setLiveCodeError(e.message || 'Failed to load code')
+        setLiveCode(null)
+      })
+      .finally(() => setLiveCodeLoading(false))
+  }, [projectId, selectedNodeId, shouldFetchLive])
+
+  const selectedCode = liveCode?.code ?? selectedNode?.data?.code ?? null
+  const selectedLabel = liveCode?.label ?? (selectedNodeId ? selectedNode?.data?.label ?? selectedNodeId : null)
+  const selectedFilePath = liveCode?.file_path ?? selectedNode?.data?.file_path ?? null
+  const selectedCodeLanguage = liveCode?.language ?? (selectedNode?.data?.kind === 'table' ? 'sql' : (kind === 'view' ? 'blade' : 'php'))
 
   return (
     <div className="w-screen h-screen flex flex-col">
       <AppHeader
         onFileSelect={onFileSelect}
+        onExport={onExport}
         selectedNodeId={selectedNodeId}
         onClearPath={onClearPath}
         error={error}
         onBack={onBack}
+        visibleKinds={visibleKinds}
+        setVisibleKinds={setVisibleKinds}
+        searchQuery={searchQuery}
+        setSearchQuery={setSearchQuery}
+        searchMatches={searchMatches}
+        onSearchSelect={onSearchSelect}
       />
       <div ref={containerRef} className="flex-1 flex overflow-hidden">
         <div className="flex-1 min-w-0">
           <ReactFlow
+            ref={reactFlowRef}
+            onInit={onReactFlowInit}
             nodeTypes={nodeTypes}
             nodes={nodesWithHighlight}
             edges={edgesWithHighlight}
@@ -116,13 +186,24 @@ export default function GraphLayout({
           style={{ width: codePanelWidth, minWidth: CODE_PANEL_MIN }}
         >
           <CodePanel
-            code={selectedCode}
+            code={liveCodeLoading ? '' : selectedCode}
             label={selectedLabel}
+            filePath={selectedFilePath}
             language={selectedCodeLanguage}
             nodeKind={selectedNode?.data?.kind}
+            loading={liveCodeLoading}
+            error={liveCodeError}
+            notes={projectId && selectedNodeId ? (nodeNotes[selectedNodeId] || []) : []}
+            onSaveNotes={projectId && selectedNodeId ? (newNotes) => {
+              updateNodeNotes(projectId, selectedNodeId, newNotes).then(() => {
+                setNodeNotes((prev) => ({ ...prev, [selectedNodeId]: newNotes }))
+              }).catch(() => {})
+            } : undefined}
           />
         </aside>
       </div>
     </div>
   )
-}
+})
+
+export default GraphLayout

@@ -4,7 +4,10 @@ Cada tipo define: detección, extensiones de archivo, clasificación por variant
 Añadir un nuevo stack (p. ej. Next.js hexagonal) = implementar este contrato y registrarlo aquí.
 """
 
+from project_types.express import EXPRESS
 from project_types.laravel import LARAVEL
+from project_types.nestjs import NESTJS
+from project_types.nextjs import NEXTJS
 
 # Contrato: cada tipo es un dict con:
 #   name: str
@@ -16,5 +19,5 @@ from project_types.laravel import LARAVEL
 # code_kind = tipo de nodo al que asociar el código del archivo (ej. "controller", "model"); None = no asociar
 
 def get_project_types():
-    """Orden de detección: el primero que detect() True gana."""
-    return [LARAVEL]
+    """Orden de detección: el primero que detect() True gana (Nest antes que Express)."""
+    return [NEXTJS, NESTJS, EXPRESS, LARAVEL]

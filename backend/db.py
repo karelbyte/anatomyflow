@@ -3,6 +3,7 @@ Capa de acceso a PostgreSQL (anatomydb).
 Conexión desde env: DATABASE_URL o POSTGRES_*.
 """
 
+import json
 import os
 import uuid
 from contextlib import contextmanager
@@ -114,6 +115,12 @@ def init_db():
                     created_at TEXT NOT NULL
                 )
             """))
+            c.execute(text("""
+                CREATE TABLE IF NOT EXISTS project_node_notes (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    notes TEXT NOT NULL DEFAULT '{}'
+                )
+            """))
             c.commit()
             try:
                 c.execute(text("ALTER TABLE projects ADD COLUMN excluded_paths TEXT DEFAULT '[]'"))
@@ -192,6 +199,12 @@ def init_db():
                 job_id UUID NOT NULL,
                 checkpoint JSONB NOT NULL,
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS project_node_notes (
+                project_id UUID PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                notes JSONB NOT NULL DEFAULT '{}'
             )
         """))
         try:
@@ -623,3 +636,35 @@ def checkpoint_clear(project_id: str) -> None:
             s.execute(text("DELETE FROM project_checkpoints WHERE project_id = :id"), {"id": project_id})
         else:
             s.execute(text("DELETE FROM project_checkpoints WHERE project_id = CAST(:id AS uuid)"), {"id": project_id})
+
+
+def node_notes_get(project_id: str) -> dict:
+    """Devuelve { node_id: [note1, note2, ...], ... } para el proyecto."""
+    with session_scope() as s:
+        from sqlalchemy import text
+        if _is_sqlite():
+            r = s.execute(text("SELECT notes FROM project_node_notes WHERE project_id = :id"), {"id": project_id})
+        else:
+            r = s.execute(text("SELECT notes FROM project_node_notes WHERE project_id = CAST(:id AS uuid)"), {"id": project_id})
+        row = r.fetchone()
+    if not row:
+        return {}
+    raw = row[0]
+    return raw if isinstance(raw, dict) else json.loads(raw or "{}")
+
+
+def node_notes_set(project_id: str, notes: dict) -> None:
+    """Reemplaza todas las notas del proyecto. notes = { node_id: [note1, ...], ... }."""
+    with session_scope() as s:
+        from sqlalchemy import text
+        payload = json.dumps(notes)
+        if _is_sqlite():
+            s.execute(text("""
+                INSERT INTO project_node_notes (project_id, notes) VALUES (:id, :notes)
+                ON CONFLICT(project_id) DO UPDATE SET notes = :notes
+            """), {"id": project_id, "notes": payload})
+        else:
+            s.execute(text("""
+                INSERT INTO project_node_notes (project_id, notes) VALUES (CAST(:id AS uuid), CAST(:notes AS jsonb))
+                ON CONFLICT(project_id) DO UPDATE SET notes = CAST(:notes AS jsonb)
+            """), {"id": project_id, "notes": payload})

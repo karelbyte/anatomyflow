@@ -14,6 +14,7 @@ import {
   getProjectEventsUrl,
   getGitHubAuthorizeUrl,
   disconnectProjectGitHub,
+  pullProjectFromGitHub,
   fetchProjectGitHubRepos,
   fetchProjectGitHubBranches,
   fetchBrowse,
@@ -24,7 +25,7 @@ import {
 const POLL_MS = 2500
 const STEPS = [
   { id: 1, label: 'Codebase' },
-  { id: 2, label: 'Agent / Schema' },
+  { id: 2, label: 'Agent / Schema (optional)' },
   { id: 3, label: 'Project tree' },
   { id: 4, label: 'Analysis' },
 ]
@@ -99,11 +100,14 @@ function TreeNode({ node, excludedPaths, onToggle, basePath, isRoot, expandedPat
   )
 }
 
-export default function ProjectDetail({ projectId, onBack, onOpenGraph }) {
+export default function ProjectDetail({ projectId, onBack, onOpenGraph, initialStep }) {
   const [project, setProject] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  const [step, setStep] = useState(1)
+  const [step, setStep] = useState(() => {
+    const s = parseInt(initialStep, 10)
+    return (s >= 1 && s <= 4) ? s : 1
+  })
   const [tree, setTree] = useState(null)
   const [treeLoading, setTreeLoading] = useState(false)
   const [treeError, setTreeError] = useState(null)
@@ -139,14 +143,20 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph }) {
   const [selectBranchName, setSelectBranchName] = useState('')
   const [savingRepoSelection, setSavingRepoSelection] = useState(false)
   const [showRepoSelector, setShowRepoSelector] = useState(false)
+  const [pullUpdating, setPullUpdating] = useState(false)
 
+  const stepRef = useRef(step)
+  stepRef.current = step
   const load = useCallback(() => {
     if (!projectId) return
     setLoading(true)
     fetchProject(projectId)
       .then((p) => {
         setProject(p)
-        setExcludedPaths(p.excluded_paths || [])
+        // No sobrescribir la selección del árbol cuando el usuario está en Step 3 (el polling pisaba todo)
+        if (stepRef.current !== 3) {
+          setExcludedPaths(p.excluded_paths || [])
+        }
       })
       .catch((e) => {
         setError(e.message)
@@ -437,10 +447,10 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph }) {
   const canGoToStep = useCallback((stepId) => {
     if (stepId === 1) return true
     if (stepId === 2) return step1Done
-    if (stepId === 3) return step2Done
+    if (stepId === 3) return step1Done
     if (stepId === 4) return step3Done
     return false
-  }, [step1Done, step2Done, step3Done])
+  }, [step1Done, step3Done])
 
   const goToStep = useCallback((next) => {
     if (next < 1 || next > 4) return
@@ -469,7 +479,7 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph }) {
       <div className="flex items-center gap-4 mb-6 flex-wrap">
         <Button variant="ghost" onClick={onBack} className="inline-flex items-center gap-2"><FiArrowLeft className="w-4 h-4" /> Back</Button>
         <Text as="h1" variant="title" className="flex-1 min-w-0 truncate">{project.name}</Text>
-        <Button variant="secondary" onClick={openEdit} className="inline-flex items-center gap-2" title="Edit name and path"><FiEdit2 className="w-4 h-4" /> Edit</Button>
+       {/*<Button variant="secondary" onClick={openEdit} className="inline-flex items-center gap-2" title="Edit name and path"><FiEdit2 className="w-4 h-4" /> Edit</Button> */} 
       </div>
 
       {/* Edit project modal */}
@@ -673,6 +683,21 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph }) {
                   <p className="flex items-center gap-2 text-sm text-emerald-400">
                     <FiCheck className="w-4 h-4 flex-shrink-0" /> GitHub account connected
                   </p>
+                  <Button
+                    variant="secondary"
+                    disabled={pullUpdating}
+                    onClick={() => {
+                      setPullUpdating(true)
+                      pullProjectFromGitHub(projectId)
+                        .then(() => toast.success('Repository updated from GitHub'))
+                        .catch((e) => toast.error(e.message || 'Failed to update'))
+                        .finally(() => setPullUpdating(false))
+                    }}
+                    className="inline-flex items-center gap-1.5 text-xs"
+                    title="Fetch latest changes from GitHub (git pull)"
+                  >
+                    <FiRefreshCw className={`w-3.5 h-3.5 ${pullUpdating ? 'animate-spin' : ''}`} /> {pullUpdating ? 'Updating…' : 'Update from GitHub'}
+                  </Button>
                   <button
                     type="button"
                     onClick={() => { setShowRepoSelector(true); setSelectRepoFullName(project.repo_url); setSelectBranchName(project.repo_branch || 'main'); }}
@@ -726,12 +751,12 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph }) {
         </section>
       )}
 
-      {/* Step 2 – Agent / Schema */}
+      {/* Step 2 – Agent / Schema (optional) */}
       {step === 2 && (
         <section className="rounded-lg border border-zinc-600 bg-zinc-800/50 p-4">
-          <Text as="h2" variant="strong" className="block mb-2">Step 2 – Agent configuration</Text>
+          <Text as="h2" variant="strong" className="block mb-2">Step 2 – Agent / Schema (optional)</Text>
           <Text variant="muted" className="block mb-2">
-            Add to the agent config (config.yaml) and run the agent. When it sends the schema, this page will update automatically.
+            Add to the agent config (config.yaml) and run the agent. When it sends the schema, this page will update automatically. You can skip this step if you only want to analyze code structure (no database tables).
           </Text>
           <div className="space-y-2">
             <div>
@@ -757,7 +782,7 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph }) {
           </div>
           <div className="flex justify-between mt-4">
             <Button variant="ghost" onClick={() => goToStep(1)} className="inline-flex items-center gap-2"><FiChevronLeft className="w-4 h-4" /> Previous</Button>
-            <Button variant="secondary" onClick={() => goToStep(3)} disabled={!step2Done} className="inline-flex items-center gap-2">Next <FiChevronRight className="w-4 h-4" /></Button>
+            <Button variant="secondary" onClick={() => goToStep(3)} className="inline-flex items-center gap-2">Next <FiChevronRight className="w-4 h-4" /></Button>
           </div>
         </section>
       )}
@@ -803,12 +828,23 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph }) {
       {step === 4 && (
         <section className="rounded-lg border border-zinc-600 bg-zinc-800/50 p-4">
           <Text as="h2" variant="strong" className="block mb-2">Step 4 – Run analysis</Text>
-          {analyzeError && <Text variant="danger" className="block mb-3">{analyzeError}</Text>}
+          {!project.has_schema && (
+            <Text variant="muted" className="block mb-3 text-sm">
+              No schema from agent: analysis will use code structure only (no database tables). You can connect the agent later and re-run to include tables.
+            </Text>
+          )}
+          {analyzeError && (
+            <div className="mb-3">
+              <Text variant="danger" className="block">{analyzeError}</Text>
+              <Text variant="muted" className="block mt-1 text-sm">
+              Check the log: LLM_INVALID_JSON = model response is not valid JSON; rate limit = reduce project size or change model.</Text>
+            </div>
+          )}
           <div className="flex flex-wrap gap-3 mb-3">
             <Button
               variant="primary"
               onClick={handleRunAnalysis}
-              disabled={analyzing || !project.has_schema || (!(project?.codebase_path?.trim()) && !(project?.repo_url?.trim()))}
+              disabled={analyzing || (!(project?.codebase_path?.trim()) && !(project?.repo_url?.trim()))}
               className="inline-flex items-center gap-2"
             >
               <FiPlay className="w-4 h-4" /> {analyzing ? 'Analyzing…' : 'Run analysis'}
@@ -845,12 +881,18 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph }) {
               </div>
             </div>
           )}
-          {analyzing && jobLog && (
+          {(analyzing || analyzeError) && (
             <div className="mt-3 rounded bg-zinc-900 border border-zinc-600 p-3">
-              <Text variant="muted" className="text-xs block mb-2">Analysis log:</Text>
-              <pre className="text-xs text-zinc-300 whitespace-pre-wrap font-mono max-h-48 overflow-y-auto">
-                {jobLog}
-              </pre>
+              <Text variant="muted" className="text-xs block mb-2">
+                Analysis log {analyzeError ? '(last run, see below)' : '— shown here while the job runs'}:
+              </Text>
+              {jobLog ? (
+                <pre className="text-xs text-zinc-300 whitespace-pre-wrap font-mono max-h-48 overflow-y-auto">
+                  {jobLog}
+                </pre>
+              ) : (
+                <Text variant="muted" className="text-sm">{analyzing ? 'Waiting for output…' : 'No log available (job may have failed before writing).'}</Text>
+              )}
             </div>
           )}
           <div className="flex justify-between mt-4">

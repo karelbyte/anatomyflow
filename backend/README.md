@@ -19,9 +19,28 @@ pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
 ```
 
+### Tests
+
+Con **uv** (usa SQLite en memoria; no hace falta Postgres):
+
+```bash
+cd backend
+uv sync
+uv run pytest tests/ -v
+```
+
 ### Variables de entorno
 
 Copia `env.example` a **`.env`** en la carpeta **backend**. Toda la configuración (Postgres y Neo4j) se lee desde ese archivo.
+
+**Auth y CORS (opcional):**
+
+| Variable | Descripción |
+|----------|-------------|
+| `BACKEND_API_KEY` | Si se define, todas las rutas `/api/*` (salvo `/api/health` y `/api/auth/github`) exigen el header `X-API-Key`. En el frontend define `VITE_API_KEY` con el mismo valor. |
+| `FRONTEND_URL` | Orígenes CORS permitidos (una URL o varias separadas por coma). Si no se define, se permite `*`. Si se define, se añaden también `http://localhost:5173` y `http://127.0.0.1:5173`. |
+| `RATE_LIMIT_PER_MIN` | Límite de peticiones por IP por minuto (por defecto 100). |
+| `RATE_LIMIT_ANALYZE_PER_MIN` | Límite para `POST .../analyze` y `.../analyze/resume` por IP (por defecto 5). |
 
 **Postgres** (proyectos, schemas, jobs, grafos):
 

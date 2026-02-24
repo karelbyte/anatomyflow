@@ -18,4 +18,6 @@ dependencies = [
 package = false
 
 [dependency-groups]
-dev = []
+dev = [
+    "pytest>=7.0.0",
+]
