@@ -2,6 +2,8 @@
 
 PoC for mapping relationships between legacy code, database schema, and API routes. Pipeline: **Agent (Go)** → schema JSON → **Analyzer (Python + LLM)** → graph JSON → **Frontend (React + React Flow)**.
 
+![Project Anatomy – Graph view](https://i.imgur.com/nYvbzgA.png)
+
 ## Repository layout
 
 | Folder      | Role |
@@ -36,6 +38,5 @@ PoC for mapping relationships between legacy code, database schema, and API rout
 - [analyzer/README.md](analyzer/README.md) – run dependency extraction with OpenAI/Anthropic.
 - [frontend/README.md](frontend/README.md) – run and build the graph UI.
 
-## Product vision
 
-See [ideas.md](ideas.md) for full product vision and architecture. This repo implements the PoC steps: schema extraction, LLM-based dependency extraction, and a basic React Flow visualizer.
+
