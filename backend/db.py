@@ -121,6 +121,13 @@ def init_db():
                     notes TEXT NOT NULL DEFAULT '{}'
                 )
             """))
+            c.execute(text("""
+                CREATE TABLE IF NOT EXISTS project_graph_ui_state (
+                    project_id TEXT PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                    state TEXT NOT NULL DEFAULT '{}',
+                    updated_at TEXT NOT NULL
+                )
+            """))
             c.commit()
             try:
                 c.execute(text("ALTER TABLE projects ADD COLUMN excluded_paths TEXT DEFAULT '[]'"))
@@ -135,6 +142,16 @@ def init_db():
                     pass
             try:
                 c.execute(text("ALTER TABLE projects ADD COLUMN github_access_token TEXT"))
+                c.commit()
+            except Exception:
+                pass
+            try:
+                c.execute(text("ALTER TABLE projects ADD COLUMN listen_updates INTEGER NOT NULL DEFAULT 0"))
+                c.commit()
+            except Exception:
+                pass
+            try:
+                c.execute(text("ALTER TABLE projects ADD COLUMN project_type TEXT DEFAULT ''"))
                 c.commit()
             except Exception:
                 pass
@@ -184,6 +201,14 @@ def init_db():
             conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS github_access_token TEXT"))
         except Exception:
             pass
+        try:
+            conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS listen_updates BOOLEAN NOT NULL DEFAULT FALSE"))
+        except Exception:
+            pass
+        try:
+            conn.execute(text("ALTER TABLE projects ADD COLUMN IF NOT EXISTS project_type VARCHAR(64) DEFAULT ''"))
+        except Exception:
+            pass
         conn.execute(text("""
             CREATE TABLE IF NOT EXISTS graphs (
                 id SERIAL PRIMARY KEY,
@@ -205,6 +230,13 @@ def init_db():
             CREATE TABLE IF NOT EXISTS project_node_notes (
                 project_id UUID PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
                 notes JSONB NOT NULL DEFAULT '{}'
+            )
+        """))
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS project_graph_ui_state (
+                project_id UUID PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                state JSONB NOT NULL DEFAULT '{}',
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         """))
         try:
@@ -236,7 +268,7 @@ def project_create(name: str, codebase_path: str = "", repo_url: str = "", repo_
             s.execute(text(
                 "INSERT INTO projects (id, name, codebase_path, agent_api_key, created_at, updated_at, repo_url, repo_branch) VALUES (CAST(:id AS uuid), :name, :path, :key, CAST(:now AS timestamptz), CAST(:now AS timestamptz), :repo_url, :repo_branch)"
             ), {"id": pid, "name": name, "path": codebase_path or "", "key": api_key, "now": now, "repo_url": repo_url or "", "repo_branch": repo_branch or "main"})
-    return {"id": pid, "name": name, "codebase_path": codebase_path or "", "agent_api_key": api_key, "created_at": now, "updated_at": now, "repo_url": repo_url or "", "repo_branch": repo_branch or "main"}
+    return {"id": pid, "name": name, "codebase_path": codebase_path or "", "agent_api_key": api_key, "created_at": now, "updated_at": now, "repo_url": repo_url or "", "repo_branch": repo_branch or "main", "listen_updates": False, "project_type": ""}
 
 
 def _parse_excluded_paths(val) -> list:
@@ -255,14 +287,23 @@ def project_list() -> list:
     with session_scope() as s:
         from sqlalchemy import text
         try:
-            r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths, repo_url, repo_branch FROM projects ORDER BY created_at DESC"))
+            r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths, repo_url, repo_branch, listen_updates, project_type FROM projects ORDER BY created_at DESC"))
             has_repo_cols = True
+            has_listen_col = True
+            has_project_type = True
         except Exception:
+            has_project_type = False
+            has_listen_col = False
             try:
-                r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths FROM projects ORDER BY created_at DESC"))
+                r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths, repo_url, repo_branch FROM projects ORDER BY created_at DESC"))
+                has_repo_cols = True
+                has_project_type = False
             except Exception:
-                r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at FROM projects ORDER BY created_at DESC"))
-            has_repo_cols = False
+                try:
+                    r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths FROM projects ORDER BY created_at DESC"))
+                except Exception:
+                    r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at FROM projects ORDER BY created_at DESC"))
+                has_repo_cols = False
         rows = r.fetchall()
         r2 = s.execute(text("SELECT DISTINCT project_id FROM graphs"))
         ids_with_graph = {str(row[0]) for row in r2.fetchall()}
@@ -285,6 +326,8 @@ def project_list() -> list:
         else:
             d["repo_url"] = ""
             d["repo_branch"] = "main"
+        d["listen_updates"] = bool(row_list[9]) if (has_listen_col and len(row_list) > 9) else False
+        d["project_type"] = (row_list[10] or "") if (has_project_type and len(row_list) > 10) else ""
         out.append(d)
     return out
 
@@ -294,17 +337,21 @@ def project_get(project_id: str) -> dict | None:
         from sqlalchemy import text
         try:
             if _is_sqlite():
-                r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths, repo_url, repo_branch FROM projects WHERE id = :id"), {"id": project_id})
+                r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths, repo_url, repo_branch, listen_updates, project_type FROM projects WHERE id = :id"), {"id": project_id})
             else:
-                r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths, repo_url, repo_branch FROM projects WHERE id = CAST(:id AS uuid)"), {"id": project_id})
+                r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths, repo_url, repo_branch, listen_updates, project_type FROM projects WHERE id = CAST(:id AS uuid)"), {"id": project_id})
             row = r.fetchone()
             has_repo_cols = True
+            has_listen_col = True
+            has_project_type = True
         except Exception:
+            has_listen_col = False
+            has_project_type = False
             try:
                 if _is_sqlite():
-                    r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths FROM projects WHERE id = :id"), {"id": project_id})
+                    r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths, repo_url, repo_branch FROM projects WHERE id = :id"), {"id": project_id})
                 else:
-                    r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths FROM projects WHERE id = CAST(:id AS uuid)"), {"id": project_id})
+                    r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at, excluded_paths, repo_url, repo_branch FROM projects WHERE id = CAST(:id AS uuid)"), {"id": project_id})
             except Exception:
                 if _is_sqlite():
                     r = s.execute(text("SELECT id, name, codebase_path, agent_api_key, created_at, updated_at FROM projects WHERE id = :id"), {"id": project_id})
@@ -319,6 +366,8 @@ def project_get(project_id: str) -> dict | None:
     d["excluded_paths"] = _parse_excluded_paths(row[6]) if len(row) > 6 else []
     d["repo_url"] = (row[7] or "") if has_repo_cols and len(row) > 8 else ""
     d["repo_branch"] = (row[8] or "main") if has_repo_cols and len(row) > 8 else "main"
+    d["listen_updates"] = bool(row[9]) if (has_listen_col and len(row) > 9) else False
+    d["project_type"] = (row[10] or "") if (has_project_type and len(row) > 10) else ""
     with session_scope() as s:
         from sqlalchemy import text
         if _is_sqlite():
@@ -340,7 +389,7 @@ def project_get(project_id: str) -> dict | None:
     return d
 
 
-def project_update(project_id: str, name: str | None = None, codebase_path: str | None = None, excluded_paths: list | None = None, repo_url: str | None = None, repo_branch: str | None = None) -> bool:
+def project_update(project_id: str, name: str | None = None, codebase_path: str | None = None, excluded_paths: list | None = None, repo_url: str | None = None, repo_branch: str | None = None, listen_updates: bool | None = None, project_type: str | None = None) -> bool:
     import json
     from sqlalchemy import text
     updates = []
@@ -360,6 +409,12 @@ def project_update(project_id: str, name: str | None = None, codebase_path: str 
     if repo_branch is not None:
         updates.append("repo_branch = :repo_branch")
         params["repo_branch"] = repo_branch
+    if listen_updates is not None:
+        updates.append("listen_updates = :listen_updates")
+        params["listen_updates"] = (1 if listen_updates else 0) if _is_sqlite() else bool(listen_updates)
+    if project_type is not None:
+        updates.append("project_type = :project_type")
+        params["project_type"] = (project_type or "").strip() if isinstance(project_type, str) else ""
     if not updates:
         return True
     updates.append("updated_at = :now")
@@ -427,6 +482,48 @@ def project_get_github_token(project_id: str) -> str | None:
 def project_has_github_connected(project_id: str) -> bool:
     """True si el proyecto tiene un token de GitHub guardado."""
     return project_get_github_token(project_id) is not None
+
+
+def _normalize_repo_url(url: str) -> str:
+    """Convierte URL o full_name a owner/repo."""
+    if not url or not isinstance(url, str):
+        return ""
+    s = url.strip()
+    # https://github.com/owner/repo o https://github.com/owner/repo.git
+    if "github.com" in s:
+        parts = s.replace(".git", "").rstrip("/").split("github.com/")
+        if len(parts) >= 2:
+            return parts[-1].split("/")[0] + "/" + parts[-1].split("/")[1] if "/" in parts[-1] else ""
+    # owner/repo
+    if "/" in s and " " not in s:
+        return s
+    return s
+
+
+def project_find_by_repo_branch(repo_full_name: str, branch: str) -> list[str]:
+    """Devuelve los IDs de proyectos con listen_updates=True y repo/branch coincidentes.
+    repo_full_name: owner/repo (ej. de GitHub repository.full_name).
+    branch: nombre de rama sin refs/heads/ (ej. main).
+    """
+    repo_norm = _normalize_repo_url(repo_full_name)
+    branch_norm = (branch or "main").strip() or "main"
+    if not repo_norm:
+        return []
+    try:
+        with session_scope() as s:
+            from sqlalchemy import text
+            if _is_sqlite():
+                r = s.execute(text(
+                    "SELECT id FROM projects WHERE listen_updates = 1 AND (repo_url = :repo OR repo_url = :repo_alt) AND (TRIM(COALESCE(repo_branch, 'main')) = :branch)"
+                ), {"repo": repo_norm, "repo_alt": f"https://github.com/{repo_norm}", "branch": branch_norm})
+            else:
+                r = s.execute(text(
+                    "SELECT id FROM projects WHERE listen_updates = TRUE AND (repo_url = :repo OR repo_url = :repo_alt) AND (TRIM(COALESCE(repo_branch, 'main')) = :branch)"
+                ), {"repo": repo_norm, "repo_alt": f"https://github.com/{repo_norm}", "branch": branch_norm})
+            rows = r.fetchall()
+    except Exception:
+        return []
+    return [str(row[0]) for row in rows]
 
 
 def project_by_api_key(api_key: str) -> dict | None:
@@ -668,3 +765,46 @@ def node_notes_set(project_id: str, notes: dict) -> None:
                 INSERT INTO project_node_notes (project_id, notes) VALUES (CAST(:id AS uuid), CAST(:notes AS jsonb))
                 ON CONFLICT(project_id) DO UPDATE SET notes = CAST(:notes AS jsonb)
             """), {"id": project_id, "notes": payload})
+
+
+def graph_ui_state_get(project_id: str) -> dict:
+    """Estado de la UI del grafo: selected_node_id, path_locked, layout_mode, node_positions."""
+    with session_scope() as s:
+        from sqlalchemy import text
+        if _is_sqlite():
+            r = s.execute(text("SELECT state FROM project_graph_ui_state WHERE project_id = :id"), {"id": project_id})
+        else:
+            r = s.execute(text("SELECT state FROM project_graph_ui_state WHERE project_id = CAST(:id AS uuid)"), {"id": project_id})
+        row = r.fetchone()
+    if not row:
+        return {}
+    raw = row[0]
+    return raw if isinstance(raw, dict) else json.loads(raw or "{}")
+
+
+def graph_ui_state_save(project_id: str, state: dict) -> None:
+    """Guarda (merge) el estado de la UI del grafo. state puede ser parcial."""
+    with session_scope() as s:
+        from sqlalchemy import text
+        if _is_sqlite():
+            r = s.execute(text("SELECT state FROM project_graph_ui_state WHERE project_id = :id"), {"id": project_id})
+        else:
+            r = s.execute(text("SELECT state FROM project_graph_ui_state WHERE project_id = CAST(:id AS uuid)"), {"id": project_id})
+        row = r.fetchone()
+        existing = {}
+        if row:
+            raw = row[0]
+            existing = raw if isinstance(raw, dict) else json.loads(raw or "{}")
+        merged = {**existing, **{k: v for k, v in state.items() if v is not None}}
+        now = datetime.utcnow().isoformat() + "Z"
+        payload = json.dumps(merged)
+        if _is_sqlite():
+            s.execute(text("""
+                INSERT INTO project_graph_ui_state (project_id, state, updated_at) VALUES (:id, :state, :now)
+                ON CONFLICT(project_id) DO UPDATE SET state = :state, updated_at = :now
+            """), {"id": project_id, "state": payload, "now": now})
+        else:
+            s.execute(text("""
+                INSERT INTO project_graph_ui_state (project_id, state, updated_at) VALUES (CAST(:id AS uuid), CAST(:state AS jsonb), CAST(:now AS timestamptz))
+                ON CONFLICT(project_id) DO UPDATE SET state = CAST(:state AS jsonb), updated_at = CAST(:now AS timestamptz)
+            """), {"id": project_id, "state": payload, "now": now})

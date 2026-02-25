@@ -76,7 +76,7 @@ export default function ProjectsList({ onNewProject, onOpenAnalysis, onViewGraph
         <div className="mt-4 rounded-lg border border-sky-600/50 bg-sky-900/20 p-4 flex items-start gap-3">
           <FiInfo className="w-5 h-5 text-sky-400 flex-shrink-0 mt-0.5" />
           <div className="flex-1 min-w-0">
-            <Text variant="strong" className="block mb-1">What does ProjectAnatomy do?</Text>
+            <Text variant="strong" className="block mb-1">What does Anatomy Flow do?</Text>
             <Text variant="body" className="text-zinc-300 text-sm">
               Connect a codebase (local or GitHub), optionally attach the schema via the agent, then run analysis to build a dependency graph: tables, models, controllers, views, routes (and for Next.js: pages, API routes, components). Click nodes to see code and highlight dependencies.
             </Text>

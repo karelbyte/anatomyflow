@@ -17,6 +17,8 @@ import {
   pullProjectFromGitHub,
   fetchProjectGitHubRepos,
   fetchProjectGitHubBranches,
+  fetchProjectWebhookInfo,
+  fetchProjectTypes,
   fetchBrowse,
   cancelJob,
   deleteProjectGraph,
@@ -29,6 +31,44 @@ const STEPS = [
   { id: 3, label: 'Project tree' },
   { id: 4, label: 'Analysis' },
 ]
+
+function ListenUpdatesWebhookBox({ projectId, webhookInfo, setWebhookInfo, onCopy }) {
+  useEffect(() => {
+    if (!projectId || webhookInfo != null) return
+    fetchProjectWebhookInfo(projectId)
+      .then(setWebhookInfo)
+      .catch(() => setWebhookInfo({ webhook_url: '', secret_env_var: 'GITHUB_WEBHOOK_SECRET', has_secret: false }))
+  }, [projectId, webhookInfo])
+  if (!webhookInfo) return <div className="text-xs text-zinc-500 mt-1">Loading webhook info…</div>
+  return (
+    <div className="mt-2 p-3 rounded-lg bg-zinc-900/80 border border-zinc-600 text-xs space-y-2">
+      <p className="text-zinc-300 font-medium">Add this webhook in GitHub so that on each push to this branch the graph is updated automatically (notes are preserved).</p>
+      <div>
+        <span className="text-zinc-500 block mb-0.5">URL</span>
+        <div className="flex gap-2 items-center">
+          <code className="flex-1 px-2 py-1.5 rounded bg-zinc-800 text-sky-400 break-all">{webhookInfo.webhook_url}</code>
+          <Button variant="secondary" onClick={() => { onCopy(webhookInfo.webhook_url); toast.success('Copied'); }} className="inline-flex items-center gap-1 shrink-0"><FiCopy className="w-3 h-3" /> Copy</Button>
+        </div>
+      </div>
+      {webhookInfo.secret ? (
+        <div>
+          <span className="text-zinc-500 block mb-0.5">Secret</span>
+          <div className="flex gap-2 items-center">
+            <code className="flex-1 px-2 py-1.5 rounded bg-zinc-800 text-amber-400 break-all font-mono truncate" title={webhookInfo.secret}>{webhookInfo.secret}</code>
+            <Button variant="secondary" onClick={() => { onCopy(webhookInfo.secret); toast.success('Secret copied'); }} className="inline-flex items-center gap-1 shrink-0"><FiCopy className="w-3 h-3" /> Copy</Button>
+          </div>
+        </div>
+      ) : (
+        <p className="text-zinc-500">
+          Set <code className="bg-zinc-800 px-1 rounded">{webhookInfo.secret_env_var}</code> in the backend .env and restart so the webhook can verify requests. Then you can copy the secret here.
+        </p>
+      )}
+      <p className="text-zinc-500">
+        In the repo: <strong>Settings → Webhooks → Add webhook</strong>. Paste the URL and the Secret above.
+      </p>
+    </div>
+  )
+}
 
 function TreeNode({ node, excludedPaths, onToggle, basePath, isRoot, expandedPaths, onToggleExpand }) {
   const path = node.path === '.' ? null : (basePath ? basePath + '/' + node.path : node.path)
@@ -144,6 +184,8 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph, initialS
   const [savingRepoSelection, setSavingRepoSelection] = useState(false)
   const [showRepoSelector, setShowRepoSelector] = useState(false)
   const [pullUpdating, setPullUpdating] = useState(false)
+  const [webhookInfo, setWebhookInfo] = useState(null)
+  const [projectTypes, setProjectTypes] = useState([])
 
   const stepRef = useRef(step)
   stepRef.current = step
@@ -166,6 +208,13 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph, initialS
   }, [projectId])
 
   useEffect(() => { load() }, [load])
+
+  useEffect(() => {
+    if (!projectId) return
+    fetchProjectTypes()
+      .then((data) => setProjectTypes(Array.isArray(data) ? data : (data.project_types || [])))
+      .catch(() => setProjectTypes([{ id: '', label: 'Auto-detect' }]))
+  }, [projectId])
 
   useEffect(() => {
     if (!projectId || !project) return
@@ -601,6 +650,27 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph, initialS
       {step === 1 && (
         <section className="rounded-lg border border-zinc-600 bg-zinc-800/50 p-4">
           <Text as="h2" variant="strong" className="block mb-2">Step 1 – Codebase</Text>
+
+          <div className="mb-4">
+            <label className="block text-sm font-medium text-zinc-300 mb-1">Project type</label>
+            <p className="text-xs text-zinc-500 mb-1">Choose how the analyzer should treat this codebase. Auto-detect uses heuristics (e.g. composer.json → Laravel).</p>
+            <select
+              value={project.project_type || ''}
+              onChange={(e) => {
+                const v = e.target.value
+                updateProject(projectId, { project_type: v })
+                  .then(setProject)
+                  .then(() => toast.success(v ? `Project type: ${(projectTypes.find((t) => t.id === v) || {}).label || v}` : 'Project type: Auto-detect'))
+                  .catch((err) => toast.error(err.message || 'Failed to update'))
+              }}
+              className="w-full max-w-md px-3 py-2 rounded bg-zinc-900 border border-zinc-600 text-zinc-100 text-sm"
+            >
+              {(projectTypes.length ? projectTypes : [{ id: '', label: 'Auto-detect' }]).map((t) => (
+                <option key={t.id} value={t.id}>{t.label}</option>
+              ))}
+            </select>
+          </div>
+
           <Text variant="muted" className="block mb-1">Code source</Text>
 
           {project.has_github_connected && (!project.repo_url || showRepoSelector) ? (
@@ -678,6 +748,27 @@ export default function ProjectDetail({ projectId, onBack, onOpenGraph, initialS
             <div className="space-y-2">
               <code className="block px-3 py-2 rounded bg-zinc-900 text-sm text-sky-400 break-all">{project.repo_url}</code>
               <span className="text-xs text-zinc-500">Branch: {project.repo_branch || 'main'}</span>
+              <label className="flex items-center gap-2 cursor-pointer mt-2">
+                <input
+                  type="checkbox"
+                  checked={!!project.listen_updates}
+                  onChange={() => {
+                    const next = !project.listen_updates
+                    updateProject(projectId, { listen_updates: next })
+                      .then(setProject)
+                      .then(() => {
+                        if (next) toast.success('Listen for updates enabled. Add the webhook in GitHub (see below).')
+                        else toast.success('Listen for updates disabled.')
+                      })
+                      .catch((e) => toast.error(e.message || 'Failed to update'))
+                  }}
+                  className="rounded border-zinc-500 bg-zinc-800 text-sky-500 focus:ring-sky-500"
+                />
+                <span className="text-sm text-zinc-300">Listen for updates on this branch</span>
+              </label>
+              {project.listen_updates && (
+                <ListenUpdatesWebhookBox projectId={projectId} webhookInfo={webhookInfo} setWebhookInfo={setWebhookInfo} onCopy={handleCopy} />
+              )}
               {project.has_github_connected ? (
                 <div className="flex flex-wrap items-center gap-2">
                   <p className="flex items-center gap-2 text-sm text-emerald-400">

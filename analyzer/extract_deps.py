@@ -29,7 +29,7 @@ def load_file(path: str) -> str:
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-from project_types import get_project_types
+from project_types import get_project_types, get_project_type_by_name
 from project_types.laravel import LARAVEL
 
 def filter_files_by_excluded_paths(files: list[str], base_path: str, excluded_paths: list[str]) -> list[str]:
@@ -324,10 +324,28 @@ def _attach_route_controller_paths(graph: dict) -> None:
 
 
 def _filter_external_nodes(graph: dict) -> None:
-    """Elimina nodos externos (sin file_path): solo quedan nodos del codebase analizado. Elimina aristas que los referencian."""
+    """
+    Elimina solo nodos realmente externos (no pertenecen al grafo del codebase).
+    Se mantienen: (1) nodos con file_path, (2) nodos conectados a ellos por aristas (route, table, view, model
+    que no tienen file_path propio pero sí pertenecen al proyecto). Así no se rompen Laravel (route/table) ni
+    otros tipos que generen nodos sintéticos; Node/Express/Next/Nest siguen igual porque sus nodos tienen file_path.
+    """
     nodes = graph.get("nodes", [])
     edges = graph.get("edges", [])
+    # Semilla: nodos con file_path (archivos del codebase)
     keep_ids = {n["id"] for n in nodes if n.get("file_path")}
+    # Expandir: nodos conectados a los que mantenemos (pertenecen al grafo)
+    changed = True
+    while changed:
+        changed = False
+        for e in edges:
+            a, b = e.get("from"), e.get("to")
+            if a in keep_ids and b not in keep_ids:
+                keep_ids.add(b)
+                changed = True
+            if b in keep_ids and a not in keep_ids:
+                keep_ids.add(a)
+                changed = True
     graph["nodes"] = [n for n in nodes if n["id"] in keep_ids]
     graph["edges"] = [e for e in edges if e.get("from") in keep_ids and e.get("to") in keep_ids]
 
@@ -690,7 +708,7 @@ def to_react_flow(graph: dict) -> dict:
     return {"nodes": nodes, "edges": edges}
 
 
-CHECKPOINT_EVERY = 5  # Escribir checkpoint cada N archivos procesados
+CHECKPOINT_EVERY = 5  # Escribir checkpoint cada 5 archivos (guardado automático para poder reanudar)
 MAX_RETRIES = 2  # Reintentos para archivos que fallan (ej. error de API); se procesan al final
 
 
@@ -720,6 +738,7 @@ def main():
     parser.add_argument("target_path", help="Path to file or folder to analyze")
     parser.add_argument("--out", dest="out_path", help="Output graph JSON path")
     parser.add_argument("--exclude-file", dest="exclude_file", help="JSON file with list of excluded paths")
+    parser.add_argument("--project-type", dest="project_type", help="Force project type (e.g. laravel, nextjs, generic_node). Overrides auto-detect.")
     parser.add_argument("--checkpoint-path", dest="checkpoint_path", help="Path to checkpoint file (save/resume)")
     parser.add_argument("--resume", action="store_true", help="Resume from checkpoint if it exists")
     args, _ = parser.parse_known_args()
@@ -771,10 +790,18 @@ def main():
     ))
     target_path = base
     project_type = None
-    for pt in get_project_types():
-        if pt["detect"](base):
-            project_type = pt
-            break
+    forced_type_name = getattr(args, "project_type", None) if args else None
+    if forced_type_name and forced_type_name.strip():
+        project_type = get_project_type_by_name(forced_type_name.strip())
+        if project_type:
+            print(f"Using project type: {project_type['name']!r} (user-selected)", file=sys.stderr)
+        else:
+            print(f"Unknown --project-type {forced_type_name!r}, falling back to auto-detect", file=sys.stderr)
+    if project_type is None:
+        for pt in get_project_types():
+            if pt["detect"](base):
+                project_type = pt
+                break
 
     # Siempre excluir vendor/node_modules/coverage; el tipo de proyecto puede añadir más
     default_exclude = ("vendor", "node_modules", "coverage")
@@ -789,7 +816,7 @@ def main():
         types_by_name = {pt["name"]: pt for pt in get_project_types()}
         project_type = types_by_name.get("generic_node")
 
-    if project_type:
+    if project_type and not forced_type_name:
         print(f"Using project type: {project_type['name']!r}", file=sys.stderr)
 
     extensions = project_type["extensions"] if project_type else (".php",)
@@ -881,11 +908,11 @@ def main():
                                 n["code"] = code
                                 n["file_path"] = rel
                     else:
-                        # Generic: one node per file; attach code only to the first node
+                        # code_kind is None (Laravel routes, generic_node): all nodes from this file get code + file_path
                         nodes = graph.get("nodes", [])
-                        if nodes:
-                            nodes[0]["code"] = code
-                            nodes[0]["file_path"] = rel
+                        for nd in nodes:
+                            nd["code"] = code
+                            nd["file_path"] = rel
                     graphs.append(graph)
                     processed_set.add(rel)
                     save_checkpoint_if_needed()

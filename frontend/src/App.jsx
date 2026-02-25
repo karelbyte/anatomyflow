@@ -7,8 +7,8 @@ import ProjectsList from './pages/ProjectsList'
 import ProjectDetail from './pages/ProjectDetail'
 import NewProjectForm from './pages/NewProjectForm'
 import { toPng } from 'html-to-image'
-import { getPathToNodeIds, getPathFromNodeIds, getCycleThroughNode, getUpstreamDistances, getDownstreamDistances, parseGraph } from './lib/graphUtils'
-import { fetchProjectGraph } from './lib/api'
+import { getPathToNodeIds, getPathFromNodeIds, getCycleThroughNode, getUpstreamDistances, getDownstreamDistances, parseGraph, getLayoutedElements } from './lib/graphUtils'
+import { fetchProjectGraph, fetchGraphUIState, updateGraphUIState } from './lib/api'
 import { KIND_CONFIG } from './constants'
 
 const emptyGraph = { nodes: [], edges: [] }
@@ -103,8 +103,11 @@ function App() {
     Object.keys(KIND_CONFIG).reduce((acc, k) => ({ ...acc, [k]: true }), {})
   )
   const [searchQuery, setSearchQuery] = useState('')
+  const [layoutMode, setLayoutMode] = useState('stored') // 'stored' = circular (backend), 'cascade' = jerárquico (front)
   const graphLayoutRef = useRef(null)
   const graphContainerRef = useRef(null)
+  const skipNextUISaveRef = useRef(false)
+  const savePositionsTimeoutRef = useRef(null)
 
   const projectKinds = useMemo(() => {
     const set = new Set(nodes.map((n) => n.data?.kind).filter(Boolean))
@@ -133,6 +136,18 @@ function App() {
     () => edges.filter((e) => visibleIds.has(e.source) && visibleIds.has(e.target)),
     [edges, visibleIds]
   )
+
+  const displayNodes = useMemo(() => {
+    if (layoutMode !== 'cascade') return filteredNodes
+    const { nodes: layouted } = getLayoutedElements(filteredNodes, filteredEdges, 'TB')
+    return layouted
+  }, [layoutMode, filteredNodes, filteredEdges])
+
+  const displayEdges = useMemo(() => {
+    if (layoutMode !== 'cascade') return filteredEdges
+    const { edges: layouted } = getLayoutedElements(filteredNodes, filteredEdges, 'TB')
+    return layouted
+  }, [layoutMode, filteredNodes, filteredEdges])
 
   const pathSourceId = lockedPathNodeId ?? selectedNodeId
   const cycleNodeIds = useMemo(
@@ -211,6 +226,16 @@ function App() {
     return () => clearTimeout(t)
   }, [searchQuery, searchMatches])
 
+  useEffect(() => {
+    if (layoutMode !== 'cascade') return
+    const t = setTimeout(() => {
+      requestAnimationFrame(() => {
+        graphLayoutRef.current?.fitView?.({ padding: 0.2, duration: 300 })
+      })
+    }, 50)
+    return () => clearTimeout(t)
+  }, [layoutMode])
+
   const nodeMetrics = useMemo(() => {
     const m = {}
     for (const n of nodes) {
@@ -233,13 +258,15 @@ function App() {
 
   const pathVisible = pathSourceId != null && !hidePathHighlight
   const nodesWithHighlight = useMemo(() => {
-    return filteredNodes.map((n) => {
+    const draggable = layoutMode === 'stored'
+    return displayNodes.map((n) => {
       if (n.type === 'clusterBg') {
-        return { ...n, data: { ...n.data, dimmed: false, pathHighlight: false } }
+        return { ...n, draggable, data: { ...n.data, dimmed: false, pathHighlight: false } }
       }
       const metrics = nodeMetrics[n.id] || {}
       return {
         ...n,
+        draggable,
         data: {
           ...n.data,
           ...metrics,
@@ -249,11 +276,11 @@ function App() {
         style: pathVisible ? { ...n.style, opacity: highlightedIds.has(n.id) ? 1 : 0.2, transition: 'opacity 0.2s ease' } : n.style,
       }
     })
-  }, [filteredNodes, pathVisible, highlightedIds, nodeMetrics])
+  }, [layoutMode, displayNodes, pathVisible, highlightedIds, nodeMetrics])
 
   const edgesWithHighlight = useMemo(() => {
-    if (!pathVisible) return filteredEdges
-    return filteredEdges.map((e) => {
+    if (!pathVisible) return displayEdges
+    return displayEdges.map((e) => {
       const inPath = highlightedIds.has(e.source) && highlightedIds.has(e.target)
       return {
         ...e,
@@ -266,7 +293,7 @@ function App() {
         labelStyle: { ...e.labelStyle, opacity: inPath ? 1 : 0.18 },
       }
     })
-  }, [filteredEdges, pathVisible, highlightedIds])
+  }, [displayEdges, pathVisible, highlightedIds])
 
   const onNodeClick = useCallback((_, node) => {
     if (node.type === 'clusterBg') {
@@ -330,6 +357,45 @@ function App() {
     () => (selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) : null),
     [nodes, selectedNodeId]
   )
+
+  const relatedNodesForSelected = useMemo(() => {
+    if (!selectedNodeId) return []
+    const byId = (id) => nodes.find((n) => n.id === id)
+    const map = new Map()
+    for (const e of filteredEdges) {
+      if (e.source === selectedNodeId && e.target !== selectedNodeId) {
+        const n = byId(e.target)
+        if (!n) continue
+        const prev = map.get(n.id) || { id: n.id, label: n.data?.label || n.id, incoming: false, outgoing: false }
+        prev.outgoing = true
+        map.set(n.id, prev)
+      }
+      if (e.target === selectedNodeId && e.source !== selectedNodeId) {
+        const n = byId(e.source)
+        if (!n) continue
+        const prev = map.get(n.id) || { id: n.id, label: n.data?.label || n.id, incoming: false, outgoing: false }
+        prev.incoming = true
+        map.set(n.id, prev)
+      }
+    }
+    return Array.from(map.values()).sort((a, b) => a.label.localeCompare(b.label))
+  }, [selectedNodeId, nodes, filteredEdges])
+
+  const modelAndTableNames = useMemo(() => {
+    const out = []
+    const seen = new Set()
+    for (const n of nodes) {
+      if (n.type === 'clusterBg' || !n.id) continue
+      const kind = (n.data?.kind || '').toLowerCase()
+      if (kind !== 'model' && kind !== 'table') continue
+      const label = n.data?.label || (n.id.includes(':') ? n.id.split(':')[1] : n.id)
+      if (label && !seen.has(label)) {
+        seen.add(label)
+        out.push(label)
+      }
+    }
+    return out
+  }, [nodes])
 
   const onFileSelect = useCallback((e) => {
     const file = e.target?.files?.[0]
@@ -456,12 +522,67 @@ function App() {
         const { nodes: n, edges: e } = parseGraph(apiGraph)
         setNodes(n)
         setEdges(e)
+        return fetchGraphUIState(graphProjectIdFromRoute).then((uiState) => {
+          if (!uiState || Object.keys(uiState).length === 0) return
+          const positions = uiState.node_positions || {}
+          const nodesWithPositions = n.map((node) => {
+            const pos = positions[node.id]
+            return pos ? { ...node, position: pos } : node
+          })
+          setNodes(nodesWithPositions)
+          if (uiState.layout_mode === 'cascade' || uiState.layout_mode === 'stored') {
+            setLayoutMode(uiState.layout_mode)
+          }
+          if (uiState.selected_node_id != null && uiState.selected_node_id !== '') {
+            setSelectedNodeId(uiState.selected_node_id)
+          }
+          if (uiState.path_locked && uiState.selected_node_id) {
+            setLockedPathNodeId(uiState.selected_node_id)
+          } else {
+            setLockedPathNodeId(null)
+          }
+          skipNextUISaveRef.current = true
+        })
       })
       .catch((e) => {
-        toast.error(e.message || 'Failed to load graph')
+        if (e?.message?.includes('No graph')) toast.error(e.message)
+        else toast.error(e?.message || 'Failed to load graph')
       })
       .finally(() => setGraphLoading(false))
   }, [graphProjectIdFromRoute])
+
+  useEffect(() => {
+    if (!graphProjectIdFromRoute) return
+    if (skipNextUISaveRef.current) {
+      skipNextUISaveRef.current = false
+      return
+    }
+    updateGraphUIState(graphProjectIdFromRoute, {
+      selected_node_id: selectedNodeId || null,
+      path_locked: lockedPathNodeId != null,
+      layout_mode: layoutMode,
+    }).catch(() => {})
+  }, [graphProjectIdFromRoute, selectedNodeId, layoutMode, lockedPathNodeId])
+
+  useEffect(() => {
+    if (!graphProjectIdFromRoute || layoutMode !== 'stored' || nodes.length === 0) return
+    if (savePositionsTimeoutRef.current) clearTimeout(savePositionsTimeoutRef.current)
+    savePositionsTimeoutRef.current = setTimeout(() => {
+      const node_positions = {}
+      nodes.forEach((n) => {
+        if (n.id && n.type !== 'clusterBg' && n.position) {
+          node_positions[n.id] = { x: n.position.x, y: n.position.y }
+        }
+      })
+      if (Object.keys(node_positions).length > 0) {
+        updateGraphUIState(graphProjectIdFromRoute, { node_positions }).catch(() => {})
+      }
+      savePositionsTimeoutRef.current = null
+    }, 600)
+    return () => {
+      if (savePositionsTimeoutRef.current) clearTimeout(savePositionsTimeoutRef.current)
+    }
+  }, [graphProjectIdFromRoute, layoutMode, nodes])
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search)
@@ -496,6 +617,8 @@ function App() {
   }, [edges])
 
   const commonGraphProps = {
+    layoutMode,
+    setLayoutMode,
     nodes,
     edges: filteredEdges,
     nodesWithHighlight,
@@ -514,6 +637,9 @@ function App() {
     onToggleHidePathHighlight: () => setHidePathHighlight((v) => !v),
     error,
     selectedNode,
+    nodeMetrics,
+    relatedNodesForSelected,
+    modelAndTableNames,
     cycleNodeIds,
     fanInFanOut,
     pathDistances,

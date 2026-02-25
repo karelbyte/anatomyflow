@@ -26,6 +26,8 @@ export default function AppHeader({
   pathHasNodes,
   onExportPathJson,
   onExportPathImage,
+  layoutMode,
+  setLayoutMode,
 }) {
   const [searchFocused, setSearchFocused] = useState(false)
   const searchRef = useRef(null)
@@ -57,6 +59,26 @@ export default function AppHeader({
           <Button variant="secondary" onClick={onExport} className="inline-flex items-center gap-2">
             <FiDownload className="w-4 h-4" />
           </Button>
+        )}
+        {setLayoutMode != null && (
+          <div className="flex items-center gap-1 rounded-md bg-zinc-800 border border-zinc-600 p-0.5">
+            <button
+              type="button"
+              onClick={() => setLayoutMode('stored')}
+              className={`px-2 py-1 text-xs font-medium rounded transition-colors ${layoutMode === 'stored' ? 'bg-sky-600 text-white' : 'text-zinc-400 hover:text-zinc-200'}`}
+              title="Circular layout (positions from analysis)"
+            >
+              Circular
+            </button>
+            <button
+              type="button"
+              onClick={() => setLayoutMode('cascade')}
+              className={`px-2 py-1 text-xs font-medium rounded transition-colors ${layoutMode === 'cascade' ? 'bg-sky-600 text-white' : 'text-zinc-400 hover:text-zinc-200'}`}
+              title="Hierarchical layout (computed in the browser)"
+            >
+              Cascade
+            </button>
+          </div>
         )}
         {showSearch && (
           <div className="relative" ref={searchRef}>

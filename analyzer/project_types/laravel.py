@@ -46,7 +46,8 @@ def _classify(file_paths: list[str], base_path: str) -> dict:
         if "Models" in parts:
             models.append(fp)
             continue
-        if len(parts) >= 1 and parts[0] == "routes" and fp.endswith(".php"):
+        # Rutas: archivos en carpeta "routes" o cuando el codebase es la propia carpeta routes
+        if fp.endswith(".php") and (parts[0] == "routes" or os.path.basename(base) == "routes"):
             routes.append(fp)
             continue
         if "Controllers" in parts or "Http" in parts:
@@ -84,10 +85,12 @@ Return a single JSON object with this exact structure (no markdown, no extra tex
 
 Rules:
 - kind must be one of: table, model, controller, route, view
-- For Laravel: link table -> model (maps_to), model -> controller (uses), controller -> route (calls). Use table names from the schema and infer model/controller/route names from the code.
-- If the controller returns a view (e.g. return view('users.index') or view('users.show', ...)), add a node with kind "view", id "view:users.index" (dot path), and an edge from controller to that view with relation "renders".
-- id must be unique (e.g. table:orders, model:Order, controller:OrderController, route:cliente.index or route:GET /clients, view:users.index).
-- For each route node, include a "code" field with the exact PHP source of the controller method that handles that route (e.g. the full method: public function index(Request $request): Response {{ ... }} ). Copy the method body exactly as in the file so the user can see the implementation.
+- You MUST create at least one route node per public method that looks like an action (index, show, store, update, destroy, etc.). id format: route:recurso.accion (e.g. route:inventory.index) or route:GET /path.
+- You MUST add an edge from this controller to each route node with relation "calls" (controller -> route).
+- For every Eloquent model used in the controller (e.g. use App\\\\Models\\\\Inventory; or Inventory::query()), add a node with kind "model", id "model:ModelName", and an edge from controller to that model with relation "uses". If the schema has the table, add table node and edge table -> model (maps_to).
+- If the controller returns a view (e.g. return view('users.index')), add a node kind "view", id "view:users.index", and an edge from controller to that view with relation "renders".
+- id must be unique (e.g. table:orders, model:Order, controller:OrderController, route:inventory.index, view:users.index).
+- For each route node, include a "code" field with the exact PHP source of the controller method that handles that route. Copy the method body exactly as in the file.
 - Only include nodes and edges you can infer from the schema and the controller code.
 """
 
@@ -148,8 +151,8 @@ Return a single JSON object with this exact structure (no markdown, no extra tex
 
 Rules:
 - kind: controller and route only (no table/model in routes files).
-- id: controller:<ClassName>, route:<METHOD> <path> (e.g. route:GET /api/orders, route:POST /api/orders).
-- Edge: controller -> route with relation "calls" (the route calls/invokes the controller).
+- id: controller:<ClassName> (exact class name, e.g. controller:InventoryController), route:<METHOD> <path> (e.g. route:GET /api/inventory, route:POST /api/orders).
+- You MUST add one route node for each Route::get/post/put/delete/patch that points to a controller, and an edge from that controller to the route with relation "calls". Use the same controller:id as in the codebase (e.g. InventoryController -> controller:InventoryController).
 - Only include nodes and edges you can infer from this routes file.
 """
 

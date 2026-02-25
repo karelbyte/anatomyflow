@@ -4,10 +4,11 @@ import ReactFlow, {
   Controls,
   MiniMap,
 } from 'reactflow'
+import { FiMaximize2, FiMinimize2 } from 'react-icons/fi'
 import 'reactflow/dist/style.css'
 import { AppHeader, CodePanel, PathPanel, AnatomyNode, ClusterBg } from '../organisms'
 import { KIND_CONFIG } from '../../constants'
-import { fetchNodeCode, fetchNodeNotes, updateNodeNotes } from '../../lib/api'
+import { fetchNodeCode, fetchNodeCodeSummary, fetchNodeNotes, updateNodeNotes } from '../../lib/api'
 
 const CODE_PANEL_MIN = 280
 const CODE_PANEL_MAX_PERCENT = 0.7
@@ -19,8 +20,13 @@ const PATH_PANEL_DEFAULT = 320
 const CODE_KINDS_FETCH = ['model', 'view', 'controller', 'route', 'page', 'api_route', 'component', 'express_route', 'middleware', 'service', 'module', 'repository', 'use_case', 'handler', 'adapter', 'entity', 'factory', 'other']
 
 const GraphLayout = forwardRef(function GraphLayout({
+  layoutMode,
+  setLayoutMode,
   nodes,
   edges,
+  nodeMetrics,
+  relatedNodesForSelected,
+  modelAndTableNames,
   nodesWithHighlight,
   edgesWithHighlight,
   onNodesChange,
@@ -59,6 +65,7 @@ const GraphLayout = forwardRef(function GraphLayout({
 }, ref) {
   const [codePanelWidth, setCodePanelWidth] = useState(CODE_PANEL_DEFAULT)
   const [pathPanelWidth, setPathPanelWidth] = useState(PATH_PANEL_DEFAULT)
+  const [graphMaximized, setGraphMaximized] = useState(false)
   const containerRef = useRef(null)
   const reactFlowRef = useRef(null)
   const reactFlowInstanceRef = useRef(null)
@@ -68,6 +75,8 @@ const GraphLayout = forwardRef(function GraphLayout({
   const [liveCodeLoading, setLiveCodeLoading] = useState(false)
   const [liveCodeError, setLiveCodeError] = useState(null)
   const [nodeNotes, setNodeNotes] = useState({})
+  const [codeSummary, setCodeSummary] = useState(null)
+  const [codeSummaryLoading, setCodeSummaryLoading] = useState(false)
 
   const nodeTypes = useMemo(() => ({
     anatomy: (props) => <AnatomyNode {...props} nodeNotes={nodeNotes} />,
@@ -160,6 +169,19 @@ const GraphLayout = forwardRef(function GraphLayout({
       .finally(() => setLiveCodeLoading(false))
   }, [projectId, selectedNodeId, shouldFetchLive])
 
+  useEffect(() => {
+    if (!projectId || !selectedNodeId) {
+      setCodeSummary(null)
+      return
+    }
+    setCodeSummaryLoading(true)
+    setCodeSummary(null)
+    fetchNodeCodeSummary(projectId, selectedNodeId)
+      .then((data) => setCodeSummary(data.summary || null))
+      .catch(() => setCodeSummary(null))
+      .finally(() => setCodeSummaryLoading(false))
+  }, [projectId, selectedNodeId])
+
   const selectedCode = liveCode?.code ?? selectedNode?.data?.code ?? null
   const selectedLabel = liveCode?.label ?? (selectedNodeId ? selectedNode?.data?.label ?? selectedNodeId : null)
   const selectedFilePath = liveCode?.file_path ?? selectedNode?.data?.file_path ?? null
@@ -168,9 +190,21 @@ const GraphLayout = forwardRef(function GraphLayout({
     ? cycleNodeIds.map((id) => nodes.find((n) => n.id === id)?.data?.label || id).join(' → ')
     : null
 
+  const handleJumpToNodeFromCode = useCallback(
+    (id) => {
+      if (!id || !onSearchSelect) return
+      const node = nodes.find((n) => n.id === id)
+      if (!node) return
+      onSearchSelect(id, node)
+    },
+    [nodes, onSearchSelect]
+  )
+
   return (
     <div className="w-screen h-screen flex flex-col">
       <AppHeader
+        layoutMode={layoutMode}
+        setLayoutMode={setLayoutMode}
         onFileSelect={onFileSelect}
         onExport={onExport}
         selectedNodeId={selectedNodeId}
@@ -193,28 +227,32 @@ const GraphLayout = forwardRef(function GraphLayout({
         onExportPathImage={onExportPathImage}
       />
       <div ref={containerRef} className="flex-1 flex overflow-hidden">
-        <aside
-          className="flex-shrink-0 flex flex-col overflow-hidden border-r border-surface-border"
-          style={{ width: pathPanelWidth, minWidth: PATH_PANEL_MIN }}
-        >
-          <PathPanel
-            cycleDisplay={cycleDisplay}
-            fanInFanOut={fanInFanOut}
-            pathDistances={pathDistances}
-            pathEdgeReasons={pathEdgeReasons}
-            pathNodesWithCode={pathNodesWithCode}
-          />
-        </aside>
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-valuenow={pathPanelWidth}
-          className="w-1.5 flex-shrink-0 bg-zinc-600 hover:bg-sky-500 cursor-col-resize select-none flex items-center justify-center group"
-          onMouseDown={onResizePathStart}
-        >
-          <span className="w-1 h-8 rounded-full bg-zinc-500 group-hover:bg-sky-400 opacity-0 group-hover:opacity-100 transition-opacity" />
-        </div>
-        <div ref={graphContainerRef} className="flex-1 min-w-0">
+        {!graphMaximized && (
+          <>
+            <aside
+              className="flex-shrink-0 flex flex-col overflow-hidden border-r border-surface-border"
+              style={{ width: pathPanelWidth, minWidth: PATH_PANEL_MIN }}
+            >
+              <PathPanel
+                cycleDisplay={cycleDisplay}
+                fanInFanOut={fanInFanOut}
+                pathDistances={pathDistances}
+                pathEdgeReasons={pathEdgeReasons}
+                pathNodesWithCode={pathNodesWithCode}
+              />
+            </aside>
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-valuenow={pathPanelWidth}
+              className="w-1.5 flex-shrink-0 bg-zinc-600 hover:bg-sky-500 cursor-col-resize select-none flex items-center justify-center group"
+              onMouseDown={onResizePathStart}
+            >
+              <span className="w-1 h-8 rounded-full bg-zinc-500 group-hover:bg-sky-400 opacity-0 group-hover:opacity-100 transition-opacity" />
+            </div>
+          </>
+        )}
+        <div ref={graphContainerRef} className="flex-1 min-w-0 relative">
           <ReactFlow
             ref={reactFlowRef}
             onInit={onReactFlowInit}
@@ -235,38 +273,59 @@ const GraphLayout = forwardRef(function GraphLayout({
             <MiniMap
               nodeColor={(n) => KIND_CONFIG[n.data?.kind]?.color ?? '#868e96'}
               maskColor="rgba(0, 0, 0, 0.7)"
+              pannable
+              zoomable
             />
           </ReactFlow>
+          <button
+            type="button"
+            onClick={() => setGraphMaximized((v) => !v)}
+            className="absolute top-2 right-2 z-20 px-2 py-1 rounded bg-zinc-900/85 border border-zinc-700 text-zinc-200 text-xs hover:bg-zinc-800 flex items-center gap-1 shadow-lg"
+            title={graphMaximized ? 'Restore layout' : 'Maximize graph'}
+          >
+            {graphMaximized ? <FiMinimize2 className="w-3 h-3" /> : <FiMaximize2 className="w-3 h-3" />}
+          </button>
         </div>
-        <div
-          role="separator"
-          aria-orientation="vertical"
-          aria-valuenow={codePanelWidth}
-          className="w-1.5 flex-shrink-0 bg-zinc-600 hover:bg-sky-500 cursor-col-resize select-none flex items-center justify-center group"
-          onMouseDown={onResizeCodeStart}
-        >
-          <span className="w-1 h-8 rounded-full bg-zinc-500 group-hover:bg-sky-400 opacity-0 group-hover:opacity-100 transition-opacity" />
-        </div>
-        <aside
-          className="flex-shrink-0 bg-panel border-l border-surface-border flex flex-col overflow-hidden"
-          style={{ width: codePanelWidth, minWidth: CODE_PANEL_MIN }}
-        >
-          <CodePanel
-            code={liveCodeLoading ? '' : selectedCode}
-            label={selectedLabel}
-            filePath={selectedFilePath}
-            language={selectedCodeLanguage}
-            nodeKind={selectedNode?.data?.kind}
-            loading={liveCodeLoading}
-            error={liveCodeError}
-            notes={projectId && selectedNodeId ? (nodeNotes[selectedNodeId] || []) : []}
-            onSaveNotes={projectId && selectedNodeId ? (newNotes) => {
-              updateNodeNotes(projectId, selectedNodeId, newNotes).then(() => {
-                setNodeNotes((prev) => ({ ...prev, [selectedNodeId]: newNotes }))
-              }).catch(() => {})
-            } : undefined}
-          />
-        </aside>
+        {!graphMaximized && (
+          <>
+            <div
+              role="separator"
+              aria-orientation="vertical"
+              aria-valuenow={codePanelWidth}
+              className="w-1.5 flex-shrink-0 bg-zinc-600 hover:bg-sky-500 cursor-col-resize select-none flex items-center justify-center group"
+              onMouseDown={onResizeCodeStart}
+            >
+              <span className="w-1 h-8 rounded-full bg-zinc-500 group-hover:bg-sky-400 opacity-0 group-hover:opacity-100 transition-opacity" />
+            </div>
+            <aside
+              className="flex-shrink-0 bg-panel border-l border-surface-border flex flex-col overflow-hidden"
+              style={{ width: codePanelWidth, minWidth: CODE_PANEL_MIN }}
+            >
+              <CodePanel
+                code={liveCodeLoading ? '' : selectedCode}
+                label={selectedLabel}
+                filePath={selectedFilePath}
+                language={selectedCodeLanguage}
+                nodeKind={selectedNode?.data?.kind}
+                loading={liveCodeLoading}
+                error={liveCodeError}
+                notes={projectId && selectedNodeId ? (nodeNotes[selectedNodeId] || []) : []}
+                metrics={selectedNodeId ? nodeMetrics[selectedNodeId] : null}
+                relatedNodes={relatedNodesForSelected}
+                onJumpToNode={handleJumpToNodeFromCode}
+                methodName={selectedNode?.data?.method_name ?? null}
+                modelAndTableNames={modelAndTableNames ?? []}
+                codeSummary={codeSummary}
+                codeSummaryLoading={codeSummaryLoading}
+                onSaveNotes={projectId && selectedNodeId ? (newNotes) => {
+                  updateNodeNotes(projectId, selectedNodeId, newNotes).then(() => {
+                    setNodeNotes((prev) => ({ ...prev, [selectedNodeId]: newNotes }))
+                  }).catch(() => {})
+                } : undefined}
+              />
+            </aside>
+          </>
+        )}
       </div>
     </div>
   )

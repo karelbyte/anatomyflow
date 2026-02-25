@@ -1,4 +1,42 @@
+import dagre from 'dagre'
 import { MarkerType } from 'reactflow'
+
+const NODE_WIDTH = 200
+const NODE_HEIGHT = 85
+
+/**
+ * Layout en cascada (jerárquico) con dagre. Excluye nodos clusterBg.
+ * @param {import('reactflow').Node[]} nodes
+ * @param {import('reactflow').Edge[]} edges
+ * @param {'TB'|'LR'} direction - TB = top-bottom (cascada), LR = left-right
+ * @returns {{ nodes: import('reactflow').Node[], edges: import('reactflow').Edge[] }}
+ */
+export function getLayoutedElements(nodes, edges, direction = 'TB') {
+  const realNodes = (nodes || []).filter((n) => n.type !== 'clusterBg' && n.id)
+  const ids = new Set(realNodes.map((n) => n.id))
+  const realEdges = (edges || []).filter((e) => ids.has(e.source) && ids.has(e.target))
+  if (realNodes.length === 0) return { nodes: realNodes, edges: realEdges }
+
+  const g = new dagre.graphlib.Graph().setDefaultEdgeLabel(() => ({}))
+  g.setGraph({ rankdir: direction, nodesep: 60, ranksep: 80 })
+
+  realNodes.forEach((n) => g.setNode(n.id, { width: NODE_WIDTH, height: NODE_HEIGHT }))
+  realEdges.forEach((e) => g.setEdge(e.source, e.target))
+
+  dagre.layout(g)
+
+  const layoutedNodes = realNodes.map((n) => {
+    const pos = g.node(n.id)
+    return {
+      ...n,
+      position: {
+        x: pos.x - NODE_WIDTH / 2,
+        y: pos.y - NODE_HEIGHT / 2,
+      },
+    }
+  })
+  return { nodes: layoutedNodes, edges: realEdges }
+}
 
 /** Returns Map of nodeId -> distance (steps) for all nodes that can reach nodeId (upstream). */
 export function getUpstreamDistances(nodeId, edges) {

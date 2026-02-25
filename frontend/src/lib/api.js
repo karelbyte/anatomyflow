@@ -38,13 +38,15 @@ export async function fetchProject(id) {
   return res.json()
 }
 
-export async function updateProject(id, { name, codebase_path, excluded_paths, repo_url, repo_branch }) {
+export async function updateProject(id, { name, codebase_path, excluded_paths, repo_url, repo_branch, listen_updates, project_type }) {
   const body = {}
   if (name !== undefined) body.name = name
   if (codebase_path !== undefined) body.codebase_path = codebase_path
   if (excluded_paths !== undefined) body.excluded_paths = excluded_paths
   if (repo_url !== undefined) body.repo_url = repo_url
   if (repo_branch !== undefined) body.repo_branch = repo_branch
+  if (listen_updates !== undefined) body.listen_updates = listen_updates
+  if (project_type !== undefined) body.project_type = project_type
   const res = await fetch(`${getBaseUrl()}/api/projects/${id}`, {
     method: 'PATCH',
     headers: getApiHeaders({ 'Content-Type': 'application/json' }),
@@ -108,6 +110,30 @@ export async function deleteProjectGraph(projectId) {
 export async function fetchProjectGraph(projectId) {
   const res = await fetch(`${getBaseUrl()}/api/projects/${projectId}/graph`, { headers: getApiHeaders() })
   if (!res.ok) throw new Error('No graph yet')
+  return res.json()
+}
+
+/** Graph UI state (selected node, path locked, layout mode, node positions) for persistence. */
+export async function fetchGraphUIState(projectId) {
+  const res = await fetch(`${getBaseUrl()}/api/projects/${projectId}/graph-ui-state`, { headers: getApiHeaders() })
+  if (!res.ok) return {}
+  return res.json()
+}
+
+export async function updateGraphUIState(projectId, state) {
+  const res = await fetch(`${getBaseUrl()}/api/projects/${projectId}/graph-ui-state`, {
+    method: 'PATCH',
+    headers: getApiHeaders({ 'Content-Type': 'application/json' }),
+    body: JSON.stringify(state),
+  })
+  if (!res.ok) throw new Error('Failed to save graph UI state')
+  return res.json()
+}
+
+/** One-sentence code summary (requires backend OPENAI_API_KEY). */
+export async function fetchNodeCodeSummary(projectId, nodeId) {
+  const res = await fetch(`${getBaseUrl()}/api/projects/${projectId}/nodes/${encodeURIComponent(nodeId)}/code-summary`, { headers: getApiHeaders() })
+  if (!res.ok) return { summary: null }
   return res.json()
 }
 
@@ -180,9 +206,14 @@ export function getWsAgentUrl() {
   return `${ws}/ws/agent`
 }
 
-/** SSE URL for live "schema_received" when the agent sends the schema */
+/** SSE URL for live "schema_received" when the agent sends the schema.
+ * EventSource cannot send headers, so we pass the API key as a query param when set. */
 export function getProjectEventsUrl(projectId) {
-  return `${getBaseUrl()}/api/projects/${projectId}/events`
+  const base = getBaseUrl()
+  const path = `/api/projects/${projectId}/events`
+  const key = import.meta.env.VITE_API_KEY
+  const qs = key ? `?api_key=${encodeURIComponent(key)}` : ''
+  return `${base}${path}${qs}`
 }
 /** Browse server folders (empty path = root). Returns { current, parent, entries, root }. */
 export async function fetchBrowse(path = '') {
@@ -242,5 +273,19 @@ export async function fetchProjectGitHubBranches(projectId, owner, repo) {
     const t = await res.text()
     throw new Error(t || 'Failed to load branches')
   }
+  return res.json()
+}
+
+/** Webhook info for "Listen for updates": URL and secret env var name */
+export async function fetchProjectWebhookInfo(projectId) {
+  const res = await fetch(`${getBaseUrl()}/api/projects/${projectId}/webhook-info`, { headers: getApiHeaders() })
+  if (!res.ok) throw new Error('Failed to load webhook info')
+  return res.json()
+}
+
+/** Project types for the analyzer (Auto-detect, Laravel, Next.js, etc.) */
+export async function fetchProjectTypes() {
+  const res = await fetch(`${getBaseUrl()}/api/project-types`, { headers: getApiHeaders() })
+  if (!res.ok) throw new Error('Failed to load project types')
   return res.json()
 }

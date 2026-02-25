@@ -204,15 +204,18 @@ app = FastAPI(title="ProjectAnatomy API", lifespan=lifespan)
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):
-    """Si BACKEND_API_KEY está definido, exige X-API-Key en /api/* salvo health y auth/github."""
+    """Si BACKEND_API_KEY está definido, exige X-API-Key en /api/* salvo health y auth/github.
+    Para GET /api/projects/{id}/events (SSE), también se acepta api_key por query (EventSource no permite headers)."""
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
-        if path == "/api/health" or path.startswith("/api/auth/github"):
+        if path == "/api/health" or path.startswith("/api/auth/github") or path == "/api/webhooks/github":
             return await call_next(request)
         if not _BACKEND_API_KEY:
             return await call_next(request)
         key = request.headers.get("X-API-Key", "").strip()
+        if not key and request.method == "GET" and "/events" in path and path.startswith("/api/projects/") and path.endswith("/events"):
+            key = (request.query_params.get("api_key") or "").strip()
         if key != _BACKEND_API_KEY:
             return JSONResponse(status_code=401, content={"detail": "Invalid or missing X-API-Key"})
         return await call_next(request)
@@ -294,6 +297,19 @@ class ProjectUpdate(BaseModel):
     excluded_paths: list[str] | None = None
     repo_url: str | None = None
     repo_branch: str | None = None
+    listen_updates: bool | None = None
+    project_type: str | None = None
+
+
+# Tipos de proyecto para el selector (mismo orden que el analizador; id = name del tipo o '' = auto)
+PROJECT_TYPE_CHOICES = [
+    {"id": "", "label": "Auto-detect"},
+    {"id": "laravel", "label": "Laravel (PHP)"},
+    {"id": "nextjs", "label": "Next.js"},
+    {"id": "nestjs", "label": "NestJS"},
+    {"id": "express", "label": "Express (Node.js)"},
+    {"id": "generic_node", "label": "Node/TypeScript (generic)"},
+]
 
 
 @app.post("/api/graph")
@@ -420,6 +436,8 @@ def update_project(project_id: str, payload: ProjectUpdate):
         excluded_paths=payload.excluded_paths,
         repo_url=payload.repo_url,
         repo_branch=payload.repo_branch,
+        listen_updates=payload.listen_updates,
+        project_type=payload.project_type,
     )
     return db.project_get(project_id)
 
@@ -589,6 +607,90 @@ def github_list_branches(project_id: str, owner: str, repo: str):
     if not isinstance(data, list):
         return []
     return [{"name": b.get("name")} for b in data if b.get("name")]
+
+
+# --- Webhook GitHub: escuchar actualizaciones (push) y re-ejecutar análisis ---
+_WEBHOOK_SECRET = os.environ.get("GITHUB_WEBHOOK_SECRET", "").strip() or None
+
+
+def _trigger_analyze_after_webhook(project_id: str) -> None:
+    """Ejecuta pull + análisis en segundo plano (mismo flujo que start_analyze)."""
+    try:
+        proj = db.project_get(project_id)
+        if not proj or not (proj.get("repo_url") or "").strip():
+            return
+        schema = db.schema_get_latest(project_id) or {}
+        excluded_paths = proj.get("excluded_paths") or []
+        db.graph_delete_all(project_id)
+        db.checkpoint_clear(project_id)
+        job_id = db.job_create(project_id)
+        try:
+            codebase_path = _resolve_codebase_path(proj, job_id)
+        except Exception as e:
+            db.job_set_failed(job_id, str(e))
+            return
+        checkpoint_dir = tempfile.mkdtemp(prefix="anatomy_webhook_")
+        pt = (proj.get("project_type") or "").strip() or None
+        thread = threading.Thread(
+            target=_run_analyzer,
+            args=(job_id, project_id, codebase_path, schema),
+            kwargs={"excluded_paths": excluded_paths or None, "checkpoint_dir": checkpoint_dir, "resume": False, "project_type": pt},
+        )
+        thread.daemon = True
+        thread.start()
+    except Exception:
+        pass
+
+
+@app.post("/api/webhooks/github")
+async def github_webhook(request: Request):
+    """
+    Webhook que recibe GitHub en cada push. Si el proyecto tiene "Escuchar actualizaciones"
+    y el repo/rama coinciden, hace pull y vuelve a ejecutar el análisis (mantiene notas por node_id).
+    Configura en GitHub: Settings → Webhooks → Add webhook.
+    URL: https://tu-backend/api/webhooks/github
+    Secret: el valor de GITHUB_WEBHOOK_SECRET en el .env del backend.
+    """
+    try:
+        raw = await request.body()
+        body = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+        payload = json.loads(body) if isinstance(body, str) else body
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+    if _WEBHOOK_SECRET:
+        sig = request.headers.get("X-Hub-Signature-256", "").strip()
+        if not sig or not sig.startswith("sha256="):
+            raise HTTPException(401, "Missing or invalid X-Hub-Signature-256")
+        import hmac
+        import hashlib
+        expected = "sha256=" + hmac.new(_WEBHOOK_SECRET.encode(), raw, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            raise HTTPException(401, "Invalid webhook signature")
+    repo = payload.get("repository") or {}
+    full_name = (repo.get("full_name") or "").strip()
+    ref = (payload.get("ref") or "").strip()
+    if not full_name:
+        return {"ok": True, "message": "Ignored (no repository)"}
+    branch = ref.replace("refs/heads/", "") if ref.startswith("refs/heads/") else ref
+    project_ids = db.project_find_by_repo_branch(full_name, branch)
+    for pid in project_ids:
+        threading.Thread(target=_trigger_analyze_after_webhook, args=(pid,), daemon=True).start()
+    return {"ok": True, "triggered": len(project_ids), "repo": full_name, "branch": branch}
+
+
+@app.get("/api/projects/{project_id}/webhook-info")
+def project_webhook_info(project_id: str, request: Request):
+    """Devuelve la URL y el secret (si está configurado) para configurar el webhook en GitHub."""
+    proj = db.project_get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    base = os.environ.get("BACKEND_PUBLIC_URL", "").strip() or str(request.base_url).rstrip("/")
+    return {
+        "webhook_url": f"{base}/api/webhooks/github",
+        "secret_env_var": "GITHUB_WEBHOOK_SECRET",
+        "has_secret": bool(_WEBHOOK_SECRET),
+        "secret": _WEBHOOK_SECRET if _WEBHOOK_SECRET else None,
+    }
 
 
 # Directorio donde se clonan repos de GitHub (env REPOS_DIR; por defecto ./repos junto al backend)
@@ -892,6 +994,24 @@ def _build_analyzer_env(analyzer_dir: str) -> dict[str, str]:
     return env
 
 
+def _save_checkpoint_from_disk_if_exists(
+    project_id: str, job_id: str, checkpoint_dir: str | None
+) -> None:
+    """Si el análisis falló o se interrumpió, guarda en BD el último checkpoint escrito en disco."""
+    if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+        return
+    ck_path = os.path.join(checkpoint_dir, "checkpoint.json")
+    if not os.path.isfile(ck_path):
+        return
+    try:
+        with open(ck_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        db.checkpoint_save(project_id, job_id, data)
+        db.job_append_log(job_id, "Progreso guardado. Puedes reanudar más tarde.")
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
 def _run_analyzer(
     job_id: str,
     project_id: str,
@@ -900,6 +1020,7 @@ def _run_analyzer(
     excluded_paths: list | None = None,
     checkpoint_dir: str | None = None,
     resume: bool = False,
+    project_type: str | None = None,
 ) -> None:
     """Ejecuta el analizador en subprocess y guarda el grafo. checkpoint_dir: carpeta para checkpoint (guardar/reanudar)."""
     db.job_set_running(job_id)
@@ -935,6 +1056,8 @@ def _run_analyzer(
         cmd = [python_exe, analyzer_path, schema_path, codebase_path, "--out", out_path]
         if exclude_file:
             cmd.extend(["--exclude-file", exclude_file])
+        if project_type and (project_type or "").strip():
+            cmd.extend(["--project-type", (project_type or "").strip()])
         if checkpoint_dir:
             ck_path = os.path.join(checkpoint_dir, "checkpoint.json")
             cmd.extend(["--checkpoint-path", ck_path])
@@ -968,6 +1091,7 @@ def _run_analyzer(
         if proc.returncode != 0:
             db.job_append_log(job_id, f"ERROR: Analizador terminó con código {proc.returncode}")
             db.job_set_failed(job_id, "Analysis failed. Check the job log.")
+            _save_checkpoint_from_disk_if_exists(project_id, job_id, checkpoint_dir)
             return
         db.job_append_log(job_id, "[4/4] Guardando grafo…")
         with open(out_path, "r", encoding="utf-8") as g:
@@ -979,12 +1103,18 @@ def _run_analyzer(
     except subprocess.TimeoutExpired:
             db.job_append_log(job_id, "ERROR: Timeout del analizador.")
             db.job_set_failed(job_id, "Timeout: el analizador tardó demasiado. Prueba con menos archivos o reanuda más tarde.")
+            _save_checkpoint_from_disk_if_exists(project_id, job_id, checkpoint_dir)
     except Exception as e:
             db.job_append_log(job_id, f"ERROR: {e}")
             db.job_set_failed(job_id, f"Error: {e}. Check the log for details.")
+            _save_checkpoint_from_disk_if_exists(project_id, job_id, checkpoint_dir)
     finally:
         with _analyzer_procs_lock:
             _job_checkpoint_dirs.pop(job_id, None)
+        # Si el análisis no terminó bien, intentar rescatar el checkpoint del disco (crash, kill, etc.)
+        job_after = db.job_get(job_id)
+        if job_after and job_after.get("status") != "completed":
+            _save_checkpoint_from_disk_if_exists(project_id, job_id, checkpoint_dir)
         try:
             os.unlink(schema_path)
         except Exception:
@@ -1025,7 +1155,7 @@ def start_analyze(project_id: str):
     thread = threading.Thread(
         target=_run_analyzer,
         args=(job_id, project_id, codebase_path, schema),
-        kwargs={"excluded_paths": excluded_paths or None, "checkpoint_dir": checkpoint_dir, "resume": False},
+        kwargs={"excluded_paths": excluded_paths or None, "checkpoint_dir": checkpoint_dir, "resume": False, "project_type": (proj.get("project_type") or "").strip() or None},
     )
     thread.daemon = True
     thread.start()
@@ -1063,11 +1193,17 @@ def resume_analyze(project_id: str):
     thread = threading.Thread(
         target=_run_analyzer,
         args=(job_id, project_id, codebase_path, schema),
-        kwargs={"excluded_paths": excluded_paths or None, "checkpoint_dir": checkpoint_dir, "resume": True},
+        kwargs={"excluded_paths": excluded_paths or None, "checkpoint_dir": checkpoint_dir, "resume": True, "project_type": (proj.get("project_type") or "").strip() or None},
     )
     thread.daemon = True
     thread.start()
     return {"job_id": job_id, "status": "pending"}
+
+
+@app.get("/api/project-types")
+def list_project_types():
+    """Lista de tipos de proyecto para el selector (Auto-detect + Laravel, Next.js, etc.)."""
+    return PROJECT_TYPE_CHOICES
 
 
 @app.get("/api/jobs/{job_id}")
@@ -1272,6 +1408,69 @@ def get_node_code(project_id: str, node_id: str):
     return {"code": code, "language": language, "label": label, "file_path": rel_path}
 
 
+def _fetch_code_summary_from_llm(code: str, language: str) -> str | None:
+    """One-sentence summary via OpenAI. Returns None if no key or error."""
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        import urllib.request
+        import urllib.error
+        body = json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You answer with a single short sentence in the same language as the user. No markdown."
+                },
+                {
+                    "role": "user",
+                    "content": f"Summarize this {language} code in one sentence:\n\n{code[:6000]}"
+                }
+            ],
+            "max_tokens": 120,
+        })
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=body.encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read().decode())
+        choice = (data.get("choices") or [None])[0]
+        if not choice:
+            return None
+        text = (choice.get("message") or {}).get("content") or ""
+        return text.strip() or None
+    except Exception:
+        return None
+
+
+@app.get("/api/projects/{project_id}/nodes/{node_id}/code-summary")
+def get_node_code_summary(project_id: str, node_id: str):
+    """Resumen en una frase del código del nodo (requiere OPENAI_API_KEY)."""
+    proj = db.project_get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    graph = db.graph_get_latest(project_id)
+    if not graph:
+        raise HTTPException(404, "No graph")
+    nodes = graph.get("nodes") or []
+    node = next((n for n in nodes if (n.get("id") or n.get("data", {}).get("id")) == node_id), None)
+    if not node:
+        raise HTTPException(404, "Node not found")
+    data = node.get("data") or node
+    code = data.get("code") or ""
+    if not code or not code.strip():
+        return {"summary": None}
+    language = "php"
+    if (data.get("kind") or "").lower() == "table":
+        language = "sql"
+    summary = _fetch_code_summary_from_llm(code, language)
+    return {"summary": summary}
+
+
 @app.get("/api/projects/{project_id}/graph")
 def get_project_graph(project_id: str):
     proj = db.project_get(project_id)
@@ -1310,6 +1509,42 @@ def delete_project_graph(project_id: str):
     db.graph_delete_all(project_id)
     db.checkpoint_clear(project_id)
     return {"ok": True}
+
+
+@app.get("/api/projects/{project_id}/graph-ui-state")
+def get_project_graph_ui_state(project_id: str):
+    """Estado persistido de la UI del grafo: nodo seleccionado, path bloqueado, layout, posiciones de nodos."""
+    proj = db.project_get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    return db.graph_ui_state_get(project_id)
+
+
+class GraphUIStatePayload(BaseModel):
+    selected_node_id: str | None = None
+    path_locked: bool | None = None
+    layout_mode: str | None = None  # "stored" | "cascade"
+    node_positions: dict[str, dict[str, float]] | None = None  # { nodeId: { x, y } }
+
+
+@app.patch("/api/projects/{project_id}/graph-ui-state")
+def patch_project_graph_ui_state(project_id: str, payload: GraphUIStatePayload):
+    """Actualiza (merge) el estado de la UI del grafo. Campos omitidos no se borran."""
+    proj = db.project_get(project_id)
+    if not proj:
+        raise HTTPException(404, "Project not found")
+    state = {}
+    if payload.selected_node_id is not None:
+        state["selected_node_id"] = payload.selected_node_id
+    if payload.path_locked is not None:
+        state["path_locked"] = payload.path_locked
+    if payload.layout_mode is not None:
+        state["layout_mode"] = payload.layout_mode
+    if payload.node_positions is not None:
+        state["node_positions"] = payload.node_positions
+    if state:
+        db.graph_ui_state_save(project_id, state)
+    return {"ok": True, "state": db.graph_ui_state_get(project_id)}
 
 
 @app.get("/api/projects/{project_id}/node-notes")
