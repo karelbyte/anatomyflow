@@ -5,15 +5,18 @@ import ReactFlow, {
   MiniMap,
 } from 'reactflow'
 import 'reactflow/dist/style.css'
-import { AppHeader, CodePanel, AnatomyNode, ClusterBg } from '../organisms'
+import { AppHeader, CodePanel, PathPanel, AnatomyNode, ClusterBg } from '../organisms'
 import { KIND_CONFIG } from '../../constants'
 import { fetchNodeCode, fetchNodeNotes, updateNodeNotes } from '../../lib/api'
 
 const CODE_PANEL_MIN = 280
 const CODE_PANEL_MAX_PERCENT = 0.7
 const CODE_PANEL_DEFAULT = 420
+const PATH_PANEL_MIN = 260
+const PATH_PANEL_MAX_PERCENT = 0.5
+const PATH_PANEL_DEFAULT = 320
 
-const CODE_KINDS_FETCH = ['model', 'view', 'controller', 'route', 'page', 'api_route', 'component', 'express_route', 'middleware', 'service', 'module']
+const CODE_KINDS_FETCH = ['model', 'view', 'controller', 'route', 'page', 'api_route', 'component', 'express_route', 'middleware', 'service', 'module', 'repository', 'use_case', 'handler', 'adapter', 'entity', 'factory', 'other']
 
 const GraphLayout = forwardRef(function GraphLayout({
   nodes,
@@ -29,22 +32,38 @@ const GraphLayout = forwardRef(function GraphLayout({
   onExport,
   selectedNodeId,
   onClearPath,
+  pathLocked,
+  onToggleLockPath,
+  hidePathHighlight,
+  onToggleHidePathHighlight,
   error,
   selectedNode,
+  cycleNodeIds,
+  fanInFanOut,
+  pathDistances,
+  pathEdgeReasons,
+  pathNodesWithCode,
   projectId,
   onBack,
   visibleKinds,
   setVisibleKinds,
+  projectKinds,
   searchQuery,
   setSearchQuery,
   searchMatches,
   onSearchSelect,
+  graphContainerRef,
+  pathHasNodes,
+  onExportPathJson,
+  onExportPathImage,
 }, ref) {
   const [codePanelWidth, setCodePanelWidth] = useState(CODE_PANEL_DEFAULT)
+  const [pathPanelWidth, setPathPanelWidth] = useState(PATH_PANEL_DEFAULT)
   const containerRef = useRef(null)
   const reactFlowRef = useRef(null)
   const reactFlowInstanceRef = useRef(null)
-  const isDragging = useRef(false)
+  const isDraggingCode = useRef(false)
+  const isDraggingPath = useRef(false)
   const [liveCode, setLiveCode] = useState(null)
   const [liveCodeLoading, setLiveCodeLoading] = useState(false)
   const [liveCodeError, setLiveCodeError] = useState(null)
@@ -73,26 +92,41 @@ const GraphLayout = forwardRef(function GraphLayout({
     },
   }), [])
 
-  const onResizeStart = useCallback((e) => {
+  const onResizeCodeStart = useCallback((e) => {
     e.preventDefault()
-    isDragging.current = true
+    isDraggingCode.current = true
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+  }, [])
+
+  const onResizePathStart = useCallback((e) => {
+    e.preventDefault()
+    isDraggingPath.current = true
     document.body.style.cursor = 'col-resize'
     document.body.style.userSelect = 'none'
   }, [])
 
   useEffect(() => {
     const handleMove = (e) => {
-      if (!isDragging.current || !containerRef.current) return
+      if (!containerRef.current) return
       const rect = containerRef.current.getBoundingClientRect()
-      const maxPx = rect.width * CODE_PANEL_MAX_PERCENT
-      const newWidth = Math.round(rect.right - e.clientX)
-      setCodePanelWidth(Math.max(CODE_PANEL_MIN, Math.min(maxPx, newWidth)))
+      const maxCodePx = rect.width * CODE_PANEL_MAX_PERCENT
+      const maxPathPx = rect.width * PATH_PANEL_MAX_PERCENT
+      if (isDraggingPath.current) {
+        const newWidth = Math.round(e.clientX - rect.left)
+        setPathPanelWidth(Math.max(PATH_PANEL_MIN, Math.min(maxPathPx, newWidth)))
+      } else if (isDraggingCode.current) {
+        const newWidth = Math.round(rect.right - e.clientX)
+        setCodePanelWidth(Math.max(CODE_PANEL_MIN, Math.min(maxCodePx, newWidth)))
+      }
     }
     const handleUp = () => {
-      if (!isDragging.current) return
-      isDragging.current = false
-      document.body.style.cursor = ''
-      document.body.style.userSelect = ''
+      if (isDraggingCode.current || isDraggingPath.current) {
+        isDraggingCode.current = false
+        isDraggingPath.current = false
+        document.body.style.cursor = ''
+        document.body.style.userSelect = ''
+      }
     }
     document.addEventListener('mousemove', handleMove)
     document.addEventListener('mouseup', handleUp)
@@ -102,7 +136,7 @@ const GraphLayout = forwardRef(function GraphLayout({
       document.body.style.cursor = ''
       document.body.style.userSelect = ''
     }
-  }, [])
+  }, [pathPanelWidth])
 
   const kind = (selectedNode?.data?.kind || '').toLowerCase()
   const shouldFetchLive = projectId && selectedNodeId && CODE_KINDS_FETCH.includes(kind)
@@ -130,6 +164,9 @@ const GraphLayout = forwardRef(function GraphLayout({
   const selectedLabel = liveCode?.label ?? (selectedNodeId ? selectedNode?.data?.label ?? selectedNodeId : null)
   const selectedFilePath = liveCode?.file_path ?? selectedNode?.data?.file_path ?? null
   const selectedCodeLanguage = liveCode?.language ?? (selectedNode?.data?.kind === 'table' ? 'sql' : (kind === 'view' ? 'blade' : 'php'))
+  const cycleDisplay = cycleNodeIds?.length && nodes?.length
+    ? cycleNodeIds.map((id) => nodes.find((n) => n.id === id)?.data?.label || id).join(' → ')
+    : null
 
   return (
     <div className="w-screen h-screen flex flex-col">
@@ -138,17 +175,46 @@ const GraphLayout = forwardRef(function GraphLayout({
         onExport={onExport}
         selectedNodeId={selectedNodeId}
         onClearPath={onClearPath}
+        pathLocked={pathLocked}
+        onToggleLockPath={onToggleLockPath}
+        hidePathHighlight={hidePathHighlight}
+        onToggleHidePathHighlight={onToggleHidePathHighlight}
         error={error}
         onBack={onBack}
         visibleKinds={visibleKinds}
         setVisibleKinds={setVisibleKinds}
+        projectKinds={projectKinds}
         searchQuery={searchQuery}
         setSearchQuery={setSearchQuery}
         searchMatches={searchMatches}
         onSearchSelect={onSearchSelect}
+        pathHasNodes={pathHasNodes}
+        onExportPathJson={onExportPathJson}
+        onExportPathImage={onExportPathImage}
       />
       <div ref={containerRef} className="flex-1 flex overflow-hidden">
-        <div className="flex-1 min-w-0">
+        <aside
+          className="flex-shrink-0 flex flex-col overflow-hidden border-r border-surface-border"
+          style={{ width: pathPanelWidth, minWidth: PATH_PANEL_MIN }}
+        >
+          <PathPanel
+            cycleDisplay={cycleDisplay}
+            fanInFanOut={fanInFanOut}
+            pathDistances={pathDistances}
+            pathEdgeReasons={pathEdgeReasons}
+            pathNodesWithCode={pathNodesWithCode}
+          />
+        </aside>
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-valuenow={pathPanelWidth}
+          className="w-1.5 flex-shrink-0 bg-zinc-600 hover:bg-sky-500 cursor-col-resize select-none flex items-center justify-center group"
+          onMouseDown={onResizePathStart}
+        >
+          <span className="w-1 h-8 rounded-full bg-zinc-500 group-hover:bg-sky-400 opacity-0 group-hover:opacity-100 transition-opacity" />
+        </div>
+        <div ref={graphContainerRef} className="flex-1 min-w-0">
           <ReactFlow
             ref={reactFlowRef}
             onInit={onReactFlowInit}
@@ -177,7 +243,7 @@ const GraphLayout = forwardRef(function GraphLayout({
           aria-orientation="vertical"
           aria-valuenow={codePanelWidth}
           className="w-1.5 flex-shrink-0 bg-zinc-600 hover:bg-sky-500 cursor-col-resize select-none flex items-center justify-center group"
-          onMouseDown={onResizeStart}
+          onMouseDown={onResizeCodeStart}
         >
           <span className="w-1 h-8 rounded-full bg-zinc-500 group-hover:bg-sky-400 opacity-0 group-hover:opacity-100 transition-opacity" />
         </div>

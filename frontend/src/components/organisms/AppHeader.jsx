@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import toast from 'react-hot-toast'
-import { FiArrowLeft, FiDownload, FiSearch, FiUpload, FiX } from 'react-icons/fi'
+import { FiArrowLeft, FiDownload, FiEye, FiEyeOff, FiImage, FiLock, FiSearch, FiUnlock, FiUpload, FiX } from 'react-icons/fi'
 import { Button, Text } from '../atoms'
 import { FileInputLabel, LegendItem } from '../molecules'
 import { KIND_CONFIG } from '../../constants'
@@ -10,14 +10,22 @@ export default function AppHeader({
   onExport,
   selectedNodeId,
   onClearPath,
+  pathLocked,
+  onToggleLockPath,
+  hidePathHighlight,
+  onToggleHidePathHighlight,
   error,
   onBack,
   visibleKinds,
   setVisibleKinds,
+  projectKinds,
   searchQuery,
   setSearchQuery,
   searchMatches,
   onSearchSelect,
+  pathHasNodes,
+  onExportPathJson,
+  onExportPathImage,
 }) {
   const [searchFocused, setSearchFocused] = useState(false)
   const searchRef = useRef(null)
@@ -83,7 +91,39 @@ export default function AppHeader({
             )}
           </div>
         )}
-        {selectedNodeId != null ? (
+        {onToggleHidePathHighlight && (
+          <Button
+            variant={hidePathHighlight ? 'primary' : 'secondary'}
+            onClick={onToggleHidePathHighlight}
+            className="inline-flex items-center gap-2"
+            title={hidePathHighlight ? 'Show path highlight when selecting a node' : 'Hide path highlight (graph stays the same when clicking nodes)'}
+          >
+            {hidePathHighlight ? <FiEyeOff className="w-4 h-4" /> : <FiEye className="w-4 h-4" />}
+            {hidePathHighlight ? 'Show path' : 'Hide path'}
+          </Button>
+        )}
+        {(selectedNodeId != null || pathLocked) && onToggleLockPath && (
+          <Button
+            variant={pathLocked ? 'primary' : 'secondary'}
+            onClick={onToggleLockPath}
+            className="inline-flex items-center gap-2"
+            title={pathLocked ? 'Unlock path (highlight stays until you unlock)' : 'Lock path (keep highlight when clicking other nodes)'}
+          >
+            {pathLocked ? <FiUnlock className="w-4 h-4" /> : <FiLock className="w-4 h-4" />}
+            {pathLocked ? 'Unlock path' : 'Lock path'}
+          </Button>
+        )}
+        {pathHasNodes && onExportPathJson && (
+          <Button variant="secondary" onClick={onExportPathJson} className="inline-flex items-center gap-2" title="Export path as JSON (nodes + edges)">
+            <FiDownload className="w-4 h-4" /> Export path (JSON)
+          </Button>
+        )}
+        {pathHasNodes && onExportPathImage && (
+          <Button variant="secondary" onClick={onExportPathImage} className="inline-flex items-center gap-2" title="Export path as PNG image">
+            <FiImage className="w-4 h-4" /> Export path (PNG)
+          </Button>
+        )}
+        {selectedNodeId != null || pathLocked ? (
           <Button variant="secondary" onClick={onClearPath} className="inline-flex items-center gap-2">
             <FiX className="w-4 h-4" /> Clear path
           </Button>
@@ -91,8 +131,11 @@ export default function AppHeader({
           <Text variant="muted" className="text-sm">Click a node to highlight its path</Text>
         )}
         <div className="flex items-center gap-4 text-xs ml-auto">
-          {Object.entries(KIND_CONFIG).map(([key, { color, label }]) => (
-            showFilters ? (
+          {(projectKinds && projectKinds.length > 0 ? projectKinds : Object.keys(KIND_CONFIG)).map((key) => {
+            const config = KIND_CONFIG[key]
+            if (!config) return null
+            const { color, label } = config
+            return showFilters ? (
               <button
                 key={key}
                 type="button"
@@ -105,7 +148,7 @@ export default function AppHeader({
             ) : (
               <LegendItem key={key} color={color} label={label} />
             )
-          ))}
+          })}
         </div>
       </div>
     </header>

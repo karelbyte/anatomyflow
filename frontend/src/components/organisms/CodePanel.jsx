@@ -30,30 +30,26 @@ export default function CodePanel({ code, label, filePath = null, language = 'ph
   }
 
   const tabBar = showTabs && (
-    <div className="flex border-b border-surface-border bg-surface flex-shrink-0">
+    <div className="flex border-b border-surface-border bg-surface flex-shrink-0 gap-0">
       <button
         type="button"
         onClick={() => setActiveTab(TAB_CODE)}
-        className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 ${
-          activeTab === TAB_CODE
-            ? 'border-sky-500 text-sky-400'
-            : 'border-transparent text-zinc-400 hover:text-zinc-200'
+        className={`px-3 py-2 text-sm font-medium transition-colors border-b-2 ${
+          activeTab === TAB_CODE ? 'border-sky-500 text-sky-400' : 'border-transparent text-zinc-400 hover:text-zinc-200'
         }`}
       >
-        Código
+        Code
       </button>
       <button
         type="button"
         onClick={() => setActiveTab(TAB_NOTES)}
-        className={`relative px-4 py-2 text-sm font-medium transition-colors border-b-2 flex items-center gap-1.5 ${
-          activeTab === TAB_NOTES
-            ? 'border-sky-500 text-sky-400'
-            : 'border-transparent text-zinc-400 hover:text-zinc-200'
+        className={`relative px-3 py-2 text-sm font-medium transition-colors border-b-2 flex items-center gap-1.5 ${
+          activeTab === TAB_NOTES ? 'border-sky-500 text-sky-400' : 'border-transparent text-zinc-400 hover:text-zinc-200'
         }`}
       >
-        Notas
+        Notes
         {hasNotes && (
-          <span className="flex items-center justify-center min-w-[18px] h-[18px] rounded-full bg-sky-500/90 text-[10px] font-bold text-white" title={`${notes.length} nota(s)`}>
+          <span className="flex items-center justify-center min-w-[18px] h-[18px] rounded-full bg-sky-500/90 text-[10px] font-bold text-white" title={`${notes.length} note(s)`}>
             {notes.length}
           </span>
         )}
@@ -121,7 +117,7 @@ export default function CodePanel({ code, label, filePath = null, language = 'ph
           value={newNote}
           onChange={(e) => setNewNote(e.target.value)}
           onKeyDown={(e) => e.key === 'Enter' && handleAddNote()}
-          placeholder="Añadir nota…"
+          placeholder="Add note…"
           className="flex-1 min-w-0 rounded bg-zinc-800 border border-zinc-600 px-2 py-1.5 text-sm text-zinc-200 placeholder-zinc-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
         />
         <Button variant="secondary" onClick={handleAddNote} className="flex-shrink-0" disabled={!newNote.trim()}>

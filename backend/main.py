@@ -609,15 +609,30 @@ def _repo_clone_path(project_id: str) -> str:
 
 def _delete_repo_folder(project_id: str) -> None:
     """Elimina la carpeta del repo clonado si existe y está dentro de _repos_dir (seguridad)."""
-    base = os.path.abspath(_repos_dir())
-    clone_path = os.path.abspath(_repo_clone_path(project_id))
-    if not clone_path.startswith(base + os.sep) and clone_path != base:
+    if not (project_id or "").strip():
         return
-    if os.path.isdir(clone_path):
+    base = os.path.normpath(os.path.abspath(_repos_dir()))
+    base_prefix = base.rstrip(os.sep) + os.sep
+
+    def _safe_remove(path: str) -> bool:
+        path = os.path.normpath(os.path.abspath(path))
+        if not (path == base or path.startswith(base_prefix)):
+            return False
+        if not os.path.isdir(path):
+            return False
         try:
-            shutil.rmtree(clone_path)
+            shutil.rmtree(path)
+            return True
         except OSError:
-            pass
+            return False
+
+    # Ruta estándar: _repo_clone_path(project_id) (project_id con caracteres no permitidos → _)
+    clone_path = _repo_clone_path(project_id)
+    if _safe_remove(clone_path):
+        return
+    # Fallback: carpeta con el project_id literal (p. ej. UUID con guiones)
+    alt_path = os.path.join(base, project_id.strip())
+    _safe_remove(alt_path)
 
 
 def _inject_github_token(url: str, token: str | None = None) -> str:

@@ -29,6 +29,12 @@ export const KIND_CONFIG = {
     border: '#20c997',
     label: 'View',
   },
+  style: {
+    color: '#fcc419',
+    bg: 'rgba(252, 196, 25, 0.12)',
+    border: '#fcc419',
+    label: 'Style',
+  },
   // Next.js
   page: {
     color: '#e64980',
@@ -73,6 +79,49 @@ export const KIND_CONFIG = {
     bg: 'rgba(218, 119, 242, 0.12)',
     border: '#da77f2',
     label: 'Module',
+  },
+  // Generic (convention-free): repository, use_case, handler, adapter, entity, factory, other
+  repository: {
+    color: '#20c997',
+    bg: 'rgba(32, 201, 151, 0.12)',
+    border: '#20c997',
+    label: 'Repository',
+  },
+  use_case: {
+    color: '#f59f00',
+    bg: 'rgba(245, 159, 0, 0.12)',
+    border: '#f59f00',
+    label: 'Use Case',
+  },
+  handler: {
+    color: '#3b82f6',
+    bg: 'rgba(59, 130, 246, 0.12)',
+    border: '#3b82f6',
+    label: 'Handler',
+  },
+  adapter: {
+    color: '#8b5cf6',
+    bg: 'rgba(139, 92, 246, 0.12)',
+    border: '#8b5cf6',
+    label: 'Adapter',
+  },
+  entity: {
+    color: '#ec4899',
+    bg: 'rgba(236, 72, 153, 0.12)',
+    border: '#ec4899',
+    label: 'Entity',
+  },
+  factory: {
+    color: '#f97316',
+    bg: 'rgba(249, 115, 22, 0.12)',
+    border: '#f97316',
+    label: 'Factory',
+  },
+  other: {
+    color: '#868e96',
+    bg: 'rgba(134, 142, 150, 0.12)',
+    border: '#868e96',
+    label: 'Other',
   },
 }
 

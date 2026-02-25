@@ -71,3 +71,5 @@ schema-extractor.*
 ideas*.md
 orders.md
 docs/
+
+backend/repos/

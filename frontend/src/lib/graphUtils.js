@@ -1,5 +1,53 @@
 import { MarkerType } from 'reactflow'
 
+/** Returns Map of nodeId -> distance (steps) for all nodes that can reach nodeId (upstream). */
+export function getUpstreamDistances(nodeId, edges) {
+  if (!nodeId || !edges?.length) return new Map()
+  const incoming = new Map()
+  for (const e of edges) {
+    if (!incoming.has(e.target)) incoming.set(e.target, [])
+    incoming.get(e.target).push(e.source)
+  }
+  const dist = new Map([[nodeId, 0]])
+  const queue = [nodeId]
+  while (queue.length) {
+    const cur = queue.shift()
+    const d = dist.get(cur) ?? 0
+    for (const prev of incoming.get(cur) || []) {
+      if (!dist.has(prev)) {
+        dist.set(prev, d + 1)
+        queue.push(prev)
+      }
+    }
+  }
+  dist.delete(nodeId)
+  return dist
+}
+
+/** Returns Map of nodeId -> distance (steps) for all nodes reachable from nodeId (downstream). */
+export function getDownstreamDistances(nodeId, edges) {
+  if (!nodeId || !edges?.length) return new Map()
+  const outgoing = new Map()
+  for (const e of edges) {
+    if (!outgoing.has(e.source)) outgoing.set(e.source, [])
+    outgoing.get(e.source).push(e.target)
+  }
+  const dist = new Map([[nodeId, 0]])
+  const queue = [nodeId]
+  while (queue.length) {
+    const cur = queue.shift()
+    const d = dist.get(cur) ?? 0
+    for (const next of outgoing.get(cur) || []) {
+      if (!dist.has(next)) {
+        dist.set(next, d + 1)
+        queue.push(next)
+      }
+    }
+  }
+  dist.delete(nodeId)
+  return dist
+}
+
 /** Nodos que tienen camino hacia nodeId (dependencias / upstream). */
 export function getPathToNodeIds(nodeId, edges) {
   if (!nodeId || !edges?.length) return new Set([nodeId])
@@ -20,6 +68,36 @@ export function getPathToNodeIds(nodeId, edges) {
     }
   }
   return out
+}
+
+/**
+ * Finds a cycle that contains nodeId (if any). Returns array of node ids [nodeId, ..., nodeId] or null.
+ */
+export function getCycleThroughNode(nodeId, edges) {
+  if (!nodeId || !edges?.length) return null
+  const outgoing = new Map()
+  for (const e of edges) {
+    if (!outgoing.has(e.source)) outgoing.set(e.source, [])
+    outgoing.get(e.source).push(e.target)
+  }
+  const path = [nodeId]
+  const visited = new Set([nodeId])
+
+  function dfs(cur) {
+    for (const next of outgoing.get(cur) || []) {
+      if (next === nodeId && path.length >= 2) return path.concat(nodeId)
+      if (!visited.has(next)) {
+        visited.add(next)
+        path.push(next)
+        const result = dfs(next)
+        if (result) return result
+        path.pop()
+        visited.delete(next)
+      }
+    }
+    return null
+  }
+  return dfs(nodeId)
 }
 
 /** Nodos alcanzables desde nodeId siguiendo aristas (dependientes / downstream = impacto). */
@@ -51,8 +129,9 @@ export function parseGraph(json) {
     return {
       ...n,
       type,
-      draggable: type !== 'clusterBg',
+      draggable: true,
       ...(type === 'anatomy' && { dragHandle: '.anatomy-drag-handle' }),
+      ...(type === 'clusterBg' && { dragHandle: '.cluster-drag-handle' }),
       data: { ...n.data, label: n.data?.label ?? n.id },
     }
   })

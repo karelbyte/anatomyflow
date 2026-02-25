@@ -1,7 +1,10 @@
 import json
+import math
 import os
+import re
 import signal
 import sys
+from pathlib import PurePosixPath
 
 try:
     from dotenv import load_dotenv
@@ -320,6 +323,44 @@ def _attach_route_controller_paths(graph: dict) -> None:
             route["method_name"] = ""
 
 
+def _filter_external_nodes(graph: dict) -> None:
+    """Elimina nodos externos (sin file_path): solo quedan nodos del codebase analizado. Elimina aristas que los referencian."""
+    nodes = graph.get("nodes", [])
+    edges = graph.get("edges", [])
+    keep_ids = {n["id"] for n in nodes if n.get("file_path")}
+    graph["nodes"] = [n for n in nodes if n["id"] in keep_ids]
+    graph["edges"] = [e for e in edges if e.get("from") in keep_ids and e.get("to") in keep_ids]
+
+
+def _infer_kind_from_path(file_path: str) -> str:
+    """Infiere un rol (kind) a partir de la ruta del archivo para nodos que vienen como 'module'."""
+    path = (file_path or "").replace("\\", "/").lower()
+    if "/repository/" in path or "/repositories/" in path or path.endswith(".repository.ts") or path.endswith(".repository.js"):
+        return "repository"
+    if "/route/" in path or "/routes/" in path or ".routes." in path:
+        return "route"
+    if "/middleware/" in path or ".middleware." in path:
+        return "middleware"
+    if "/domain/" in path:
+        return "entity"
+    if "/config/" in path:
+        return "adapter"
+    if "/auth/" in path or "/service/" in path or "/services/" in path:
+        return "service"
+    if "/handler/" in path or "/handlers/" in path or "/use-case/" in path or "/usecase/" in path:
+        return "handler"
+    if path.endswith("app.ts") or path.endswith("app.js") or path.endswith("index.ts") or path.endswith("index.js") or "/server" in path:
+        return "module"
+    return "module"
+
+
+def _apply_inferred_kinds(graph: dict) -> None:
+    """Para nodos con kind 'module' y file_path, reasigna kind según la ruta (repository, route, middleware, etc.)."""
+    for n in graph.get("nodes", []):
+        if (n.get("kind") or "").lower() == "module" and n.get("file_path"):
+            n["kind"] = _infer_kind_from_path(n["file_path"])
+
+
 def merge_graphs(graphs: list[dict]) -> dict:
     nodes_by_id = {}
     edges_set = set()
@@ -357,6 +398,118 @@ def _build_adjacency(edges: list[dict]) -> tuple[dict, dict]:
         outgoing[a].append(b)
     return incoming, outgoing
 
+
+def _ensure_local_import_edges(graph: dict) -> None:
+    """
+    Asegura que haya aristas "imports" entre módulos TypeScript/JavaScript
+    cuando hay imports locales (./, ../) en el código fuente, incluso si el
+    extractor LLM no las devolvió explícitamente.
+    """
+    nodes = graph.get("nodes") or []
+    edges = graph.get("edges") or []
+    nodes_by_id = {n.get("id"): n for n in nodes if n.get("id")}
+    existing = {(e.get("from"), e.get("to"), e.get("relation", "uses")) for e in edges}
+
+    exts_ts_js = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+    new_edges: list[dict] = []
+    new_nodes: list[dict] = []
+
+    for n in nodes:
+        nid = n.get("id") or ""
+        code = n.get("code") or ""
+        file_path = n.get("file_path") or ""
+        if not nid or not code or not file_path:
+            continue
+        if not file_path.endswith(exts_ts_js):
+            continue
+
+        specs: set[str] = set()
+        # import X from './foo'
+        for m in re.finditer(r"from\s+['\"]([^'\"]+)['\"]", code):
+            specs.add(m.group(1))
+        # import './foo'
+        for m in re.finditer(r"\bimport\s+['\"]([^'\"]+)['\"]", code):
+            specs.add(m.group(1))
+
+        base_dir = PurePosixPath(file_path).parent
+
+        # 1) Imports locales TS/JS
+        for spec in specs:
+            # Solo imports locales del propio codebase
+            if not spec.startswith("."):
+                continue
+            try:
+                raw_path = (base_dir / spec).as_posix()
+                norm_path = os.path.normpath(raw_path).replace("\\", "/")
+                # Los nodos TS/JS usan id sin extensión (.ts/.js/etc)
+                target_rel = re.sub(r"\.(ts|tsx|js|jsx|mjs|cjs)$", "", norm_path)
+            except Exception:
+                continue
+
+            target_id = f"module:{target_rel}"
+            if target_id not in nodes_by_id:
+                continue
+
+            key = (nid, target_id, "imports")
+            if key in existing:
+                continue
+
+            new_edges.append({"from": nid, "to": target_id, "relation": "imports"})
+            existing.add(key)
+
+        # 2) Angular templateUrl / styleUrl(s) → nodos de vista/estilo
+        # templateUrl: './login.component.html'
+        tpl_match = re.search(r"templateUrl\s*:\s*['\"]([^'\"]+)['\"]", code)
+        template_specs: list[str] = []
+        if tpl_match:
+            template_specs.append(tpl_match.group(1).strip())
+
+        # styleUrl: './login.component.scss'
+        style_specs: list[str] = []
+        single_style = re.search(r"styleUrl\s*:\s*['\"]([^'\"]+)['\"]", code)
+        if single_style:
+            style_specs.append(single_style.group(1).strip())
+        for m in re.finditer(r"styleUrls?\s*:\s*\[([^\]]*)\]", code, flags=re.S):
+            inner = m.group(1)
+            for sm in re.finditer(r"['\"]([^'\"]+)['\"]", inner):
+                style_specs.append(sm.group(1).strip())
+
+        def _ensure_file_node(spec: str, kind: str, relation: str) -> None:
+            nonlocal nodes, nodes_by_id, new_nodes, new_edges, existing
+            try:
+                raw_path = (base_dir / spec).as_posix()
+                target_rel = os.path.normpath(raw_path).replace("\\", "/")
+            except Exception:
+                return
+            node_id = f"{kind}:{target_rel}"
+            if node_id not in nodes_by_id:
+                label = PurePosixPath(target_rel).name
+                node = {
+                    "id": node_id,
+                    "label": label,
+                    "kind": kind if kind != "style" else "style",
+                    "file_path": target_rel,
+                }
+                nodes_by_id[node_id] = node
+                new_nodes.append(node)
+            key = (nid, node_id, relation)
+            if key in existing:
+                return
+            new_edges.append({"from": nid, "to": node_id, "relation": relation})
+            existing.add(key)
+
+        for spec in template_specs:
+            _ensure_file_node(spec, "view", "template")
+        for spec in style_specs:
+            _ensure_file_node(spec, "style", "styles")
+
+    if new_nodes:
+        nodes.extend(new_nodes)
+        graph["nodes"] = nodes
+    if new_edges:
+        edges.extend(new_edges)
+        graph["edges"] = edges
+
 def _cluster_around_controller(controller_id: str, incoming: dict, outgoing: dict) -> set:
     cluster = {controller_id}
     queue = [controller_id]
@@ -376,11 +529,13 @@ def _layout_by_clusters(graph: dict) -> list[dict]:
     nodes_by_id = {n["id"]: n for n in graph.get("nodes", [])}
     edges = graph.get("edges", [])
     incoming, outgoing = _build_adjacency(edges)
-    # Semilla de clusters: controller (Laravel/Nest), page (Next.js), express_route (Express)
+    # Semilla de clusters: controller, page, express_route, handler, service (modo genérico)
     controller_ids = [nid for nid, n in nodes_by_id.items() if n.get("kind") == "controller"]
     page_ids = [nid for nid, n in nodes_by_id.items() if n.get("kind") == "page"]
     express_route_ids = [nid for nid, n in nodes_by_id.items() if n.get("kind") == "express_route"]
-    seed_ids = controller_ids or page_ids or express_route_ids
+    handler_ids = [nid for nid, n in nodes_by_id.items() if n.get("kind") == "handler"]
+    service_ids = [nid for nid, n in nodes_by_id.items() if n.get("kind") == "service"]
+    seed_ids = controller_ids or page_ids or express_route_ids or handler_ids or service_ids
     assigned = set()
     clusters = []
     for cid in seed_ids:
@@ -395,67 +550,113 @@ def _layout_by_clusters(graph: dict) -> list[dict]:
     if orphan:
         clusters.append(orphan)
 
-    kind_order = {"table": 0, "model": 1, "controller": 2, "route": 3, "view": 4, "page": 2, "api_route": 3, "component": 4, "express_route": 2, "middleware": 3, "service": 1, "module": 0}
-    kinds_layout = ["table", "model", "controller", "route", "view", "page", "api_route", "component", "express_route", "middleware", "service", "module"]
-    col_width = 240
-    row_height = 90
-    cluster_gap = 80
+    # Kinds: convencionales + genéricos (repository, use_case, handler, adapter, entity, factory, other)
+    kind_order = {
+        "table": 0, "model": 1, "entity": 1, "repository": 2, "service": 2, "use_case": 3,
+        "controller": 3, "handler": 3, "adapter": 4, "route": 4, "express_route": 4,
+        "view": 5, "style": 5, "page": 5, "api_route": 5, "component": 5, "middleware": 4, "module": 0,
+        "factory": 2, "other": 9,
+    }
+    kinds_layout = [
+        "table", "model", "entity", "repository", "service", "use_case", "factory",
+        "controller", "handler", "adapter", "route", "express_route", "middleware",
+        "view", "style", "page", "api_route", "component", "module", "other",
+    ]
+    cluster_gap = 28
     node_w = 200
     node_h = 85
     padding = 24
-    clusters_per_row = 5
-    # Tamaño de cada “celda” para un montón (ancho ≈ 4 columnas + hueco, alto para varias filas)
-    slot_width = len(kinds_layout) * col_width + cluster_gap
-    slot_height = 6 * row_height + cluster_gap
-    positions = {}
-    result = []
+    clusters_per_row = 6
 
-    for idx, cluster_ids in enumerate(clusters):
+    # Layout circular/radial dentro de cada cluster: nodos ordenados por kind+label, dispuestos en círculo
+    def _place_cluster_circular(cluster_ids, nodes_by_id, kind_order, kinds_layout):
         by_kind = {k: [] for k in kinds_layout}
         for nid in cluster_ids:
             n = nodes_by_id.get(nid)
             if not n:
                 continue
-            k = n.get("kind") or "default"
+            k = (n.get("kind") or "default").strip().lower()
             if k not in kind_order:
-                k = "route"
+                k = "other"
             if k not in by_kind:
                 by_kind[k] = []
             by_kind[k].append((nid, n.get("label", nid)))
         for k in by_kind:
             by_kind[k].sort(key=lambda x: x[1])
+        ordered = []
+        for kind in kinds_layout:
+            ordered.extend(by_kind.get(kind, []))
+        if not ordered:
+            return {}, float("inf"), float("inf"), float("-inf"), float("-inf")
+        n_nodes = len(ordered)
+        # Radio para que los nodos no se solapen: cuerda entre centros >= node_w
+        min_radius = (node_w / 2) / math.sin(math.pi / n_nodes) if n_nodes > 1 else 80
+        radius = max(100, min_radius)
+        local_pos = {}
+        cluster_min_x = float("inf")
+        cluster_min_y = float("inf")
+        cluster_max_x = float("-inf")
+        cluster_max_y = float("-inf")
+        for i, (nid, _) in enumerate(ordered):
+            angle = 2 * math.pi * i / n_nodes - math.pi / 2  # empieza arriba
+            cx = radius * math.cos(angle)
+            cy = radius * math.sin(angle)
+            # React Flow usa esquina superior izquierda
+            x = cx - node_w / 2
+            y = cy - node_h / 2
+            local_pos[nid] = {"x": x, "y": y}
+            cluster_min_x = min(cluster_min_x, x)
+            cluster_min_y = min(cluster_min_y, y)
+            cluster_max_x = max(cluster_max_x, x + node_w)
+            cluster_max_y = max(cluster_max_y, y + node_h)
+        return local_pos, cluster_min_x, cluster_min_y, cluster_max_x, cluster_max_y
 
-        max_rows = max(len(by_kind.get(k, [])) for k in kinds_layout) or 1
-        row_slot = idx // clusters_per_row
-        col_slot = idx % clusters_per_row
-        offset_x = col_slot * slot_width
-        offset_y = row_slot * slot_height
-        cluster_min_x = offset_x
-        cluster_min_y = offset_y
-        for col, kind in enumerate(kinds_layout):
-            for row, (nid, _) in enumerate(by_kind.get(kind, [])):
-                positions[nid] = {
-                    "x": offset_x + col * col_width,
-                    "y": offset_y + row * row_height,
-                }
-        cluster_max_x = offset_x + len(kinds_layout) * col_width + node_w
-        cluster_max_y = offset_y + (max_rows - 1) * row_height + node_h
+    cluster_data = []
+    for cluster_ids in clusters:
+        local_pos, cmin_x, cmin_y, cmax_x, cmax_y = _place_cluster_circular(
+            cluster_ids, nodes_by_id, kind_order, kinds_layout
+        )
+        if cmin_x == float("inf"):
+            continue
+        cw = (cmax_x - cmin_x) + 2 * padding
+        ch = (cmax_y - cmin_y) + 2 * padding
+        cluster_data.append((cluster_ids, local_pos, cmin_x, cmin_y, cmax_x, cmax_y, cw, ch))
+
+    # Segunda pasada: colocar clusters en filas con gap fijo (empaquetado)
+    positions = {}
+    node_to_cluster = {}
+    result = []
+    cursor_x = 0
+    cursor_y = 0
+    row_heights = []
+    for idx, (cluster_ids, local_pos, cmin_x, cmin_y, cmax_x, cmax_y, cw, ch) in enumerate(cluster_data):
+        col_in_row = idx % clusters_per_row
+        if col_in_row == 0 and idx > 0:
+            cursor_x = 0
+            cursor_y += (max(row_heights) if row_heights else 0) + cluster_gap
+            row_heights = []
+        offset_x = cursor_x + padding - cmin_x
+        offset_y = cursor_y + padding - cmin_y
         bg_id = f"cluster-bg-{idx}"
+        for nid, lp in local_pos.items():
+            positions[nid] = {"x": lp["x"] + offset_x, "y": lp["y"] + offset_y}
+            node_to_cluster[nid] = bg_id
+        row_heights.append(ch)
         result.append({
             "id": bg_id,
             "type": "clusterBg",
-            "position": {"x": cluster_min_x - padding, "y": cluster_min_y - padding},
-            "data": {
-                "width": cluster_max_x - cluster_min_x + 2 * padding,
-                "height": cluster_max_y - cluster_min_y + 2 * padding,
-                "label": "",
-            },
+            "position": {"x": cursor_x, "y": cursor_y},
+            "data": {"width": cw, "height": ch, "label": ""},
         })
+        cursor_x += cw + cluster_gap
 
     for n in graph.get("nodes", []):
         nid = n.get("id")
         pos = positions.get(nid, {"x": 0, "y": 0})
         data = {"label": n.get("label", nid), "kind": n.get("kind", "default"), "orphan": n.get("orphan", False)}
+        cluster_id = node_to_cluster.get(nid)
+        if cluster_id:
+            data["clusterId"] = cluster_id
         if n.get("code"):
             data["code"] = n["code"]
         if n.get("file_path"):
@@ -578,26 +779,15 @@ def main():
     # Siempre excluir vendor/node_modules/coverage; el tipo de proyecto puede añadir más
     default_exclude = ("vendor", "node_modules", "coverage")
 
-    # Fallback 1: si hay package.json pero ningún tipo lo detectó (path/encoding en detect), elegir por dependencias
+    # Fallback 1: si hay package.json pero ningún tipo lo detectó (path/encoding), usar generic_node
     if project_type is None and os.path.isfile(os.path.join(base, "package.json")):
-        try:
-            with open(os.path.join(base, "package.json"), "r", encoding="utf-8") as f:
-                pkg = json.load(f)
-            deps = {**(pkg.get("dependencies") or {}), **(pkg.get("devDependencies") or {})}
-            types_by_name = {pt["name"]: pt for pt in get_project_types()}
-            if "next" in deps:
-                project_type = types_by_name.get("nextjs")
-            elif "@nestjs/core" in deps:
-                project_type = types_by_name.get("nestjs")
-            elif "express" in deps:
-                project_type = types_by_name.get("express")
-        except (OSError, json.JSONDecodeError):
-            pass
+        types_by_name = {pt["name"]: pt for pt in get_project_types()}
+        project_type = types_by_name.get("generic_node")
 
-    # Fallback 2: si sigue sin tipo pero hay archivos .js/.ts, usar Express (evita "no .php files" en repos Node)
+    # Fallback 2: si sigue sin tipo pero hay archivos .js/.ts, usar generic_node (evita "no .php files" en repos Node)
     if project_type is None and _has_node_like_files(base, default_exclude):
         types_by_name = {pt["name"]: pt for pt in get_project_types()}
-        project_type = types_by_name.get("express")
+        project_type = types_by_name.get("generic_node")
 
     if project_type:
         print(f"Using project type: {project_type['name']!r}", file=sys.stderr)
@@ -676,17 +866,26 @@ def main():
                 print(f"  [{current_run}/{pending}] [{variant_name}] {rel}", file=sys.stderr)
                 try:
                     code = load_file(filepath)
-                    prompt = build_prompt_fn(schema, code)
+                    try:
+                        prompt = build_prompt_fn(schema, code, file_path=rel)
+                    except TypeError:
+                        prompt = build_prompt_fn(schema, code)
                     if not _schema_has_tables(schema):
                         prompt += NO_SCHEMA_PROMPT_SUFFIX
                     raw = provider(prompt)
                     graph = parse_llm_json(raw)
-                    if code_kind:
+                    if code_kind is not None:
                         kind_lower = (code_kind or "").lower()
                         for n in graph.get("nodes", []):
                             if (n.get("kind") or "").lower() == kind_lower:
                                 n["code"] = code
                                 n["file_path"] = rel
+                    else:
+                        # Generic: one node per file; attach code only to the first node
+                        nodes = graph.get("nodes", [])
+                        if nodes:
+                            nodes[0]["code"] = code
+                            nodes[0]["file_path"] = rel
                     graphs.append(graph)
                     processed_set.add(rel)
                     save_checkpoint_if_needed()
@@ -738,17 +937,25 @@ def main():
         for filepath, rel, build_prompt_fn, code_kind in to_retry:
             try:
                 code = load_file(filepath)
-                prompt = build_prompt_fn(schema, code)
+                try:
+                    prompt = build_prompt_fn(schema, code, file_path=rel)
+                except TypeError:
+                    prompt = build_prompt_fn(schema, code)
                 if not _schema_has_tables(schema):
                     prompt += NO_SCHEMA_PROMPT_SUFFIX
                 raw = provider(prompt)
                 graph = parse_llm_json(raw)
-                if code_kind:
+                if code_kind is not None:
                     kind_lower = (code_kind or "").lower()
                     for n in graph.get("nodes", []):
                         if (n.get("kind") or "").lower() == kind_lower:
                             n["code"] = code
                             n["file_path"] = rel
+                else:
+                    nodes = graph.get("nodes", [])
+                    if nodes:
+                        nodes[0]["code"] = code
+                        nodes[0]["file_path"] = rel
                 graphs.append(graph)
                 processed_set.add(rel)
                 save_checkpoint_if_needed()
@@ -770,6 +977,9 @@ def main():
         sys.exit(1)
 
     merged = merge_graphs(graphs)
+    _ensure_local_import_edges(merged)
+    _filter_external_nodes(merged)
+    _apply_inferred_kinds(merged)
     _filter_tables_to_schema_only(merged, schema)
     _mark_orphans(merged)
     _attach_route_controller_paths(merged)

@@ -1,16 +1,18 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Routes, Route, useNavigate, useLocation, useParams } from 'react-router-dom'
 import toast from 'react-hot-toast'
-import { useNodesState, useEdgesState } from 'reactflow'
+import { useNodesState, useEdgesState, applyNodeChanges } from 'reactflow'
 import GraphLayout from './components/templates/GraphLayout'
 import ProjectsList from './pages/ProjectsList'
 import ProjectDetail from './pages/ProjectDetail'
 import NewProjectForm from './pages/NewProjectForm'
-import { getPathToNodeIds, getPathFromNodeIds, parseGraph } from './lib/graphUtils'
+import { toPng } from 'html-to-image'
+import { getPathToNodeIds, getPathFromNodeIds, getCycleThroughNode, getUpstreamDistances, getDownstreamDistances, parseGraph } from './lib/graphUtils'
 import { fetchProjectGraph } from './lib/api'
 import { KIND_CONFIG } from './constants'
 
 const emptyGraph = { nodes: [], edges: [] }
+const CRITICAL_NODE_THRESHOLD = 3 // fanIn or fanOut >= this → "critical" (many connections)
 
 function matchSearch(node, query) {
   if (!query || !node?.data) return false
@@ -65,16 +67,54 @@ function App() {
     return m ? m[1] : null
   }, [pathname])
 
-  const [nodes, setNodes, onNodesChange] = useNodesState(emptyGraph.nodes)
+  const [nodes, setNodes, onNodesChangeBase] = useNodesState(emptyGraph.nodes)
+  const onNodesChange = useCallback(
+    (changes) => {
+      setNodes((oldNodes) => {
+        const next = applyNodeChanges(changes, oldNodes)
+        const clusterChange = changes.find(
+          (c) => c.type === 'position' && c.id?.startsWith('cluster-bg-') && c.position != null
+        )
+        if (!clusterChange) return next
+        const clusterId = clusterChange.id
+        const newPos = clusterChange.position
+        const oldClusterNode = oldNodes.find((n) => n.id === clusterId)
+        if (!oldClusterNode) return next
+        const delta = {
+          x: newPos.x - oldClusterNode.position.x,
+          y: newPos.y - oldClusterNode.position.y,
+        }
+        return next.map((n) =>
+          n.data?.clusterId === clusterId
+            ? { ...n, position: { x: n.position.x + delta.x, y: n.position.y + delta.y } }
+            : n
+        )
+      })
+    },
+    [setNodes]
+  )
   const [edges, setEdges, onEdgesChange] = useEdgesState(emptyGraph.edges)
   const [graphLoading, setGraphLoading] = useState(false)
   const [error, setError] = useState(null)
   const [selectedNodeId, setSelectedNodeId] = useState(null)
+  const [lockedPathNodeId, setLockedPathNodeId] = useState(null)
+  const [hidePathHighlight, setHidePathHighlight] = useState(false)
   const [visibleKinds, setVisibleKinds] = useState(() =>
     Object.keys(KIND_CONFIG).reduce((acc, k) => ({ ...acc, [k]: true }), {})
   )
   const [searchQuery, setSearchQuery] = useState('')
   const graphLayoutRef = useRef(null)
+  const graphContainerRef = useRef(null)
+
+  const projectKinds = useMemo(() => {
+    const set = new Set(nodes.map((n) => n.data?.kind).filter(Boolean))
+    return set.size > 0 ? [...set] : Object.keys(KIND_CONFIG)
+  }, [nodes])
+
+  useEffect(() => {
+    if (projectKinds.length === 0 || projectKinds.length === Object.keys(KIND_CONFIG).length) return
+    setVisibleKinds(projectKinds.reduce((acc, k) => ({ ...acc, [k]: true }), {}))
+  }, [projectKinds])
 
   const filteredNodes = useMemo(() => {
     const q = searchQuery.trim().toLowerCase()
@@ -94,12 +134,62 @@ function App() {
     [edges, visibleIds]
   )
 
+  const pathSourceId = lockedPathNodeId ?? selectedNodeId
+  const cycleNodeIds = useMemo(
+    () => (pathSourceId ? getCycleThroughNode(pathSourceId, filteredEdges) : null),
+    [pathSourceId, filteredEdges]
+  )
+  const fanInFanOut = useMemo(() => {
+    if (!pathSourceId || !filteredEdges.length) return null
+    let fanIn = 0
+    let fanOut = 0
+    for (const e of filteredEdges) {
+      if (e.target === pathSourceId) fanIn++
+      if (e.source === pathSourceId) fanOut++
+    }
+    return { fanIn, fanOut }
+  }, [pathSourceId, filteredEdges])
+
+  const pathDistances = useMemo(() => {
+    if (!pathSourceId || !filteredEdges.length || !nodes.length) return null
+    const up = getUpstreamDistances(pathSourceId, filteredEdges)
+    const down = getDownstreamDistances(pathSourceId, filteredEdges)
+    const byId = (id) => nodes.find((n) => n.id === id)?.data?.label || id
+    return {
+      upstream: [...up.entries()].map(([id, d]) => ({ id, label: byId(id), distance: d })).sort((a, b) => a.distance - b.distance),
+      downstream: [...down.entries()].map(([id, d]) => ({ id, label: byId(id), distance: d })).sort((a, b) => a.distance - b.distance),
+    }
+  }, [pathSourceId, filteredEdges, nodes])
+
   const highlightedIds = useMemo(() => {
-    if (!selectedNodeId) return new Set()
-    const upstream = getPathToNodeIds(selectedNodeId, filteredEdges)
-    const downstream = getPathFromNodeIds(selectedNodeId, filteredEdges)
+    if (!pathSourceId) return new Set()
+    const upstream = getPathToNodeIds(pathSourceId, filteredEdges)
+    const downstream = getPathFromNodeIds(pathSourceId, filteredEdges)
     return new Set([...upstream, ...downstream])
-  }, [selectedNodeId, filteredEdges])
+  }, [pathSourceId, filteredEdges])
+
+  const pathEdgeReasons = useMemo(() => {
+    if (!highlightedIds?.size || !filteredEdges.length || !nodes.length) return null
+    const byId = (id) => nodes.find((n) => n.id === id)?.data?.label || id
+    return filteredEdges
+      .filter((e) => highlightedIds.has(e.source) && highlightedIds.has(e.target))
+      .map((e) => ({ from: byId(e.source), to: byId(e.target), relation: e.data?.relation || e.label || 'uses' }))
+  }, [highlightedIds, filteredEdges, nodes])
+
+  const pathOrder = useMemo(() => {
+    if (!pathDistances || !pathSourceId) return []
+    const up = pathDistances.upstream.map((u) => u.id).reverse()
+    const down = pathDistances.downstream.map((d) => d.id)
+    return [...up, pathSourceId, ...down]
+  }, [pathDistances, pathSourceId])
+
+
+  const pathNodesWithCode = useMemo(() => {
+    if (!highlightedIds?.size || !nodes.length) return []
+    return nodes
+      .filter((n) => n.id && highlightedIds.has(n.id) && n.type !== 'clusterBg' && (n.data?.code || ''))
+      .map((n) => ({ id: n.id, label: n.data?.label || n.id, code: n.data?.code || '' }))
+  }, [highlightedIds, nodes])
 
   const searchMatches = useMemo(
     () => filteredNodes.filter((n) => n.type !== 'clusterBg' && matchSearch(n, searchQuery)),
@@ -121,25 +211,48 @@ function App() {
     return () => clearTimeout(t)
   }, [searchQuery, searchMatches])
 
+  const nodeMetrics = useMemo(() => {
+    const m = {}
+    for (const n of nodes) {
+      if (n.type === 'clusterBg' || !n.id) continue
+      m[n.id] = { fanIn: 0, fanOut: 0 }
+    }
+    for (const e of filteredEdges) {
+      if (m[e.target]) m[e.target].fanIn++
+      if (m[e.source]) m[e.source].fanOut++
+    }
+    for (const id of Object.keys(m)) {
+      const fanIn = m[id].fanIn
+      const fanOut = m[id].fanOut
+      m[id].isEntry = fanIn === 0
+      m[id].isLeaf = fanOut === 0
+      m[id].isCritical = fanIn >= CRITICAL_NODE_THRESHOLD || fanOut >= CRITICAL_NODE_THRESHOLD
+    }
+    return m
+  }, [nodes, filteredEdges])
+
+  const pathVisible = pathSourceId != null && !hidePathHighlight
   const nodesWithHighlight = useMemo(() => {
     return filteredNodes.map((n) => {
       if (n.type === 'clusterBg') {
         return { ...n, data: { ...n.data, dimmed: false, pathHighlight: false } }
       }
+      const metrics = nodeMetrics[n.id] || {}
       return {
         ...n,
         data: {
           ...n.data,
-          dimmed: selectedNodeId != null ? !highlightedIds.has(n.id) : false,
-          pathHighlight: selectedNodeId != null && highlightedIds.has(n.id),
+          ...metrics,
+          dimmed: pathVisible ? !highlightedIds.has(n.id) : false,
+          pathHighlight: pathVisible && highlightedIds.has(n.id),
         },
-        style: selectedNodeId != null ? { ...n.style, opacity: highlightedIds.has(n.id) ? 1 : 0.2, transition: 'opacity 0.2s ease' } : n.style,
+        style: pathVisible ? { ...n.style, opacity: highlightedIds.has(n.id) ? 1 : 0.2, transition: 'opacity 0.2s ease' } : n.style,
       }
     })
-  }, [filteredNodes, selectedNodeId, highlightedIds])
+  }, [filteredNodes, pathVisible, highlightedIds, nodeMetrics])
 
   const edgesWithHighlight = useMemo(() => {
-    if (selectedNodeId == null) return filteredEdges
+    if (!pathVisible) return filteredEdges
     return filteredEdges.map((e) => {
       const inPath = highlightedIds.has(e.source) && highlightedIds.has(e.target)
       return {
@@ -153,7 +266,7 @@ function App() {
         labelStyle: { ...e.labelStyle, opacity: inPath ? 1 : 0.18 },
       }
     })
-  }, [filteredEdges, selectedNodeId, highlightedIds])
+  }, [filteredEdges, pathVisible, highlightedIds])
 
   const onNodeClick = useCallback((_, node) => {
     if (node.type === 'clusterBg') {
@@ -164,17 +277,54 @@ function App() {
   }, [])
 
   const onPaneClick = useCallback(() => {
-    setSelectedNodeId(null)
+    if (!lockedPathNodeId) setSelectedNodeId(null)
     setSearchQuery('')
-  }, [])
+  }, [lockedPathNodeId])
   const onEdgeClick = useCallback(() => {
-    setSelectedNodeId(null)
+    if (!lockedPathNodeId) setSelectedNodeId(null)
     setSearchQuery('')
-  }, [])
+  }, [lockedPathNodeId])
   const onClearPath = useCallback(() => {
     setSelectedNodeId(null)
+    setLockedPathNodeId(null)
     setSearchQuery('')
   }, [])
+  const isGraphView = pathname === '/graph' || /^\/projects\/[^/]+\/graph$/.test(pathname)
+  useEffect(() => {
+    if (!isGraphView) return
+    const onKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        onClearPath()
+        e.preventDefault()
+        return
+      }
+      if (pathOrder.length === 0) return
+      const current = selectedNodeId ?? pathSourceId
+      const idx = pathOrder.indexOf(current)
+      if (idx === -1) return
+      if (e.key === 'ArrowRight' || e.key === 'ArrowDown') {
+        const next = pathOrder[idx + 1]
+        if (next) {
+          setSelectedNodeId(next)
+          e.preventDefault()
+        }
+      } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
+        const prev = pathOrder[idx - 1]
+        if (prev) {
+          setSelectedNodeId(prev)
+          e.preventDefault()
+        }
+      }
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [isGraphView, pathOrder, selectedNodeId, pathSourceId, onClearPath])
+  const onToggleLockPath = useCallback(() => {
+    setLockedPathNodeId((prev) => {
+      if (prev != null) return null
+      return selectedNodeId ?? prev
+    })
+  }, [selectedNodeId])
 
   const selectedNode = useMemo(
     () => (selectedNodeId ? nodes.find((n) => n.id === selectedNodeId) : null),
@@ -212,6 +362,78 @@ function App() {
     URL.revokeObjectURL(a.href)
     toast.success('Graph exported')
   }, [nodes, edges, graphProjectIdFromRoute])
+
+  const pathHasNodes = highlightedIds?.size > 0
+  const onExportPathJson = useCallback(() => {
+    if (!pathHasNodes) return
+    const pathNodes = nodes.filter((n) => n.id && highlightedIds.has(n.id) && n.type !== 'clusterBg')
+    const pathEdges = filteredEdges.filter((e) => highlightedIds.has(e.source) && highlightedIds.has(e.target))
+    const payload = {
+      pathSourceId,
+      exportedAt: new Date().toISOString(),
+      nodes: pathNodes.map((n) => ({ id: n.id, data: n.data, position: n.position })),
+      edges: pathEdges.map((e) => ({ source: e.source, target: e.target, data: e.data })),
+    }
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: 'application/json' })
+    const a = document.createElement('a')
+    a.href = URL.createObjectURL(blob)
+    a.download = `path-${pathSourceId || 'export'}-${Date.now()}.json`
+    a.click()
+    URL.revokeObjectURL(a.href)
+    toast.success('Path exported as JSON')
+  }, [pathHasNodes, pathSourceId, nodes, filteredEdges, highlightedIds])
+
+  const onExportPathImage = useCallback(() => {
+    if (!pathHasNodes || !graphContainerRef.current) return
+    const pathNodeIds = Array.from(highlightedIds)
+    graphLayoutRef.current?.fitView?.({ nodes: pathNodeIds.map((id) => ({ id })), padding: 0.3, duration: 300 })
+    setTimeout(() => {
+      const flowEl = graphContainerRef.current.querySelector('.react-flow')
+      const target = flowEl || graphContainerRef.current
+      // Force inline SVG attributes on edge paths so html-to-image clone shows them (cloned DOM often loses CSS for SVG)
+      const edgePaths = target.querySelectorAll('.react-flow__edge-path, .react-flow__connection-path')
+      const restores = []
+      edgePaths.forEach((path) => {
+        const origStroke = path.getAttribute('stroke')
+        const origSw = path.getAttribute('stroke-width')
+        const origFill = path.getAttribute('fill')
+        restores.push({ path, origStroke, origSw, origFill })
+        const stroke = origStroke || getComputedStyle(path).stroke
+        const sw = (origSw || getComputedStyle(path).strokeWidth || '2').toString().replace('px', '')
+        const fill = origFill || getComputedStyle(path).fill
+        path.setAttribute('stroke', stroke && stroke !== 'none' ? stroke : '#a1a1aa')
+        path.setAttribute('stroke-width', sw || '2')
+        path.setAttribute('fill', fill && fill !== 'none' ? fill : 'none')
+      })
+      toPng(target, { pixelRatio: 2, backgroundColor: '#18181b' })
+        .then((dataUrl) => {
+          restores.forEach(({ path, origStroke, origSw, origFill }) => {
+            if (origStroke != null) path.setAttribute('stroke', origStroke)
+            else path.removeAttribute('stroke')
+            if (origSw != null) path.setAttribute('stroke-width', origSw)
+            else path.removeAttribute('stroke-width')
+            if (origFill != null) path.setAttribute('fill', origFill)
+            else path.removeAttribute('fill')
+          })
+          const a = document.createElement('a')
+          a.href = dataUrl
+          a.download = `path-${pathSourceId || 'export'}-${Date.now()}.png`
+          a.click()
+          toast.success('Path exported as image')
+        })
+        .catch(() => {
+          restores.forEach(({ path, origStroke, origSw, origFill }) => {
+            if (origStroke != null) path.setAttribute('stroke', origStroke)
+            else path.removeAttribute('stroke')
+            if (origSw != null) path.setAttribute('stroke-width', origSw)
+            else path.removeAttribute('stroke-width')
+            if (origFill != null) path.setAttribute('fill', origFill)
+            else path.removeAttribute('fill')
+          })
+          toast.error('Failed to export image')
+        })
+    }, 500)
+  }, [pathHasNodes, pathSourceId, highlightedIds])
 
   useEffect(() => {
     if (!graphProjectIdFromRoute) return
@@ -286,15 +508,29 @@ function App() {
     onFileSelect,
     selectedNodeId,
     onClearPath,
+    pathLocked: lockedPathNodeId != null,
+    onToggleLockPath,
+    hidePathHighlight,
+    onToggleHidePathHighlight: () => setHidePathHighlight((v) => !v),
     error,
     selectedNode,
+    cycleNodeIds,
+    fanInFanOut,
+    pathDistances,
+    pathEdgeReasons,
+    pathNodesWithCode,
     onExport,
     visibleKinds,
     setVisibleKinds,
+    projectKinds,
     searchQuery,
     setSearchQuery,
     searchMatches,
     onSearchSelect,
+    graphContainerRef,
+    pathHasNodes,
+    onExportPathJson,
+    onExportPathImage,
   }
 
   return (
